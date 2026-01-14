@@ -1,0 +1,69 @@
+{
+  "sample_size": {
+    "asserted": 500,
+    "asserted_publisher": 500,
+    "asserted_crossref": 0,
+    "mined": 500,
+    "total": 1000
+  },
+  "asserted_results": {
+    "count": 500,
+    "crossref_citing_found": 500,
+    "crossref_has_references": 500,
+    "crossref_structured_doi_match": 499,
+    "crossref_structured_match_rate": 0.998,
+    "crossref_unstructured_only": 0,
+    "crossref_unstructured_only_rate": 0.0,
+    "crossref_no_match": 1,
+    "crossref_no_match_rate": 0.002,
+    "openalex_citing_found": 467,
+    "openalex_arxiv_in_refs": 1,
+    "openalex_match_rate": 0.002,
+    "datacite_event_found": 0,
+    "datacite_event_match_rate": 0.0,
+    "opencitations_citing_found": 0,
+    "opencitations_arxiv_in_refs": 0,
+    "opencitations_match_rate": 0.0
+  },
+  "asserted_publisher_results": {
+    "count": 500,
+    "crossref_citing_found": 500,
+    "crossref_has_references": 500,
+    "crossref_structured_doi_match": 499,
+    "crossref_structured_match_rate": 0.998,
+    "crossref_unstructured_only": 0,
+    "crossref_unstructured_only_rate": 0.0,
+    "crossref_no_match": 1,
+    "crossref_no_match_rate": 0.002,
+    "openalex_citing_found": 467,
+    "openalex_arxiv_in_refs": 1,
+    "openalex_match_rate": 0.002,
+    "datacite_event_found": 0,
+    "datacite_event_match_rate": 0.0,
+    "opencitations_citing_found": 0,
+    "opencitations_arxiv_in_refs": 0,
+    "opencitations_match_rate": 0.0
+  },
+  "asserted_crossref_results": {
+    "count": 0
+  },
+  "mined_results": {
+    "count": 500,
+    "crossref_citing_found": 500,
+    "crossref_has_references": 500,
+    "crossref_structured_doi_match": 1,
+    "crossref_structured_match_rate": 0.002,
+    "crossref_unstructured_only": 498,
+    "crossref_unstructured_only_rate": 0.996,
+    "crossref_no_match": 1,
+    "crossref_no_match_rate": 0.002,
+    "openalex_citing_found": 437,
+    "openalex_arxiv_in_refs": 93,
+    "openalex_match_rate": 0.186,
+    "datacite_event_found": 0,
+    "datacite_event_match_rate": 0.0,
+    "opencitations_citing_found": 0,
+    "opencitations_arxiv_in_refs": 0,
+    "opencitations_match_rate": 0.0
+  }
+}

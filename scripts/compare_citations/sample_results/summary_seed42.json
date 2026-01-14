@@ -1,0 +1,53 @@
+{
+  "sample_size": {
+    "asserted": 1000,
+    "asserted_publisher": 88,
+    "asserted_crossref": 0,
+    "mined": 0,
+    "total": 1000
+  },
+  "asserted_results": {
+    "count": 1000,
+    "crossref_citing_found": 1000,
+    "crossref_has_references": 1000,
+    "crossref_structured_doi_match": 83,
+    "crossref_structured_match_rate": 0.083,
+    "crossref_unstructured_only": 911,
+    "crossref_unstructured_only_rate": 0.911,
+    "crossref_no_match": 6,
+    "crossref_no_match_rate": 0.006,
+    "openalex_citing_found": 992,
+    "openalex_arxiv_in_refs": 190,
+    "openalex_match_rate": 0.19,
+    "datacite_event_found": 0,
+    "datacite_event_match_rate": 0.0,
+    "opencitations_citing_found": 0,
+    "opencitations_arxiv_in_refs": 0,
+    "opencitations_match_rate": 0.0
+  },
+  "asserted_publisher_results": {
+    "count": 88,
+    "crossref_citing_found": 88,
+    "crossref_has_references": 88,
+    "crossref_structured_doi_match": 83,
+    "crossref_structured_match_rate": 0.9431818181818182,
+    "crossref_unstructured_only": 0,
+    "crossref_unstructured_only_rate": 0.0,
+    "crossref_no_match": 5,
+    "crossref_no_match_rate": 0.056818181818181816,
+    "openalex_citing_found": 88,
+    "openalex_arxiv_in_refs": 2,
+    "openalex_match_rate": 0.022727272727272728,
+    "datacite_event_found": 0,
+    "datacite_event_match_rate": 0.0,
+    "opencitations_citing_found": 0,
+    "opencitations_arxiv_in_refs": 0,
+    "opencitations_match_rate": 0.0
+  },
+  "asserted_crossref_results": {
+    "count": 0
+  },
+  "mined_results": {
+    "count": 0
+  }
+}
