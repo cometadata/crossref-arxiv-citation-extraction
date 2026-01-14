@@ -37,20 +37,6 @@ uv run scripts/compare_citations/compare_citations.py \
 
 The token can also be set via the `CROSSREF_API_TOKEN` environment variable.
 
-### Skip Slow APIs
-
-DataCite and OpenCitations can be slow; skip them for faster runs:
-
-```bash
-uv run scripts/compare_citations/compare_citations.py \
-  --sample 100 \
-  --mailto you@example.com \
-  --skip-datacite \
-  --skip-opencitations \
-  --output-csv results.csv \
-  --output-json summary.json
-```
-
 ## Options
 
 | Option | Description |
