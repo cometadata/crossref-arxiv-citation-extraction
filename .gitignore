@@ -1,0 +1,35 @@
+# Build artifacts
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude
+CLAUDE.md
+.claude/
+
+# Dev container
+.devcontainer/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output files
+*.jsonl
+*.jsonl.*
+*.json
+!package.json
+*.parquet
+*.fst
+
+# Sample/test data
+*.tar.gz
+
+# Logs
+*.log

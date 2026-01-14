@@ -1,0 +1,227 @@
+use clap::{Parser, Subcommand};
+use std::collections::HashSet;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputType {
+    Valid,
+    Failed,
+    Publisher,
+    Crossref,
+    Mined,
+}
+
+impl FromStr for OutputType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "valid" => Ok(OutputType::Valid),
+            "failed" => Ok(OutputType::Failed),
+            "publisher" => Ok(OutputType::Publisher),
+            "crossref" => Ok(OutputType::Crossref),
+            "mined" => Ok(OutputType::Mined),
+            _ => Err(format!(
+                "Invalid output type: '{}'. Valid options: valid, failed, publisher, crossref, mined",
+                s
+            )),
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "crossref-citation-extraction")]
+#[command(about = "Extract, invert, and validate DOI references from Crossref data")]
+#[command(version = "2.0.0")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Run the pipeline: extract arXiv IDs, aggregate by cited work, validate
+    ///
+    /// Streams through the Crossref tar.gz archive, extracts arXiv references,
+    /// partitions by arXiv ID prefix, aggregates in parallel, and validates against
+    /// arXiv index.
+    Pipeline(Box<PipelineArgs>),
+
+    /// Build FST index from arXiv (DataCite) records
+    BuildIndex {
+        /// Input path (tar.gz, directory, or JSONL file)
+        #[arg(short, long)]
+        input: String,
+
+        /// Output FST file path
+        #[arg(short, long)]
+        output: String,
+
+        /// Log level
+        #[arg(long, default_value = "INFO")]
+        log_level: String,
+    },
+}
+
+#[derive(Parser, Clone)]
+pub struct PipelineArgs {
+    /// Path to the Crossref snapshot tar.gz file
+    #[arg(short, long, required = true)]
+    pub input: String,
+
+    /// arXiv records.jsonl.gz file for validation
+    #[arg(long)]
+    pub arxiv_records: Option<String>,
+
+    /// Provenance filter for extraction (comma-separated: publisher,crossref,mined)
+    /// Only extract DOIs with matching provenance. Default: all provenances if not specified.
+    #[arg(long, value_delimiter = ',')]
+    pub provenance: Vec<String>,
+
+    /// Output types to generate (comma-separated: valid,failed,publisher,crossref,mined)
+    /// Default: all outputs if not specified
+    #[arg(long, value_delimiter = ',')]
+    pub outputs: Vec<String>,
+
+    /// Directory for output files (default: current directory)
+    #[arg(long)]
+    pub output_dir: Option<String>,
+
+    /// Path to existing partition directory (skips extraction, runs aggregation only)
+    /// Use this to re-run aggregation with different output selections
+    #[arg(long)]
+    pub partitions_dir: Option<String>,
+
+    /// Logging level (DEBUG, INFO, WARN, ERROR)
+    #[arg(short, long, default_value = "INFO")]
+    pub log_level: String,
+
+    /// Keep intermediate files (partitions, temp parquet)
+    #[arg(long, default_value = "false")]
+    pub keep_intermediates: bool,
+
+    /// Directory for intermediate partition files (default: system temp)
+    #[arg(long)]
+    pub temp_dir: Option<String>,
+
+    /// Batch size for memory management during streaming
+    #[arg(long, default_value = "5000000")]
+    pub batch_size: usize,
+
+    /// Path to pre-built arXiv FST index
+    #[arg(long)]
+    pub arxiv_fst: Option<String>,
+
+    /// Resume from checkpoint if available
+    #[arg(long, default_value = "false")]
+    pub resume: bool,
+
+    /// Checkpoint interval: save progress every N partitions during aggregation
+    #[arg(long, default_value = "50")]
+    pub checkpoint_interval: usize,
+}
+
+impl PipelineArgs {
+    /// Parse outputs into a HashSet.
+    /// Supports "all" alias for all output types.
+    pub fn parse_outputs(&self) -> Result<HashSet<OutputType>, String> {
+        if self.outputs.is_empty() || self.outputs.iter().any(|s| s.to_lowercase() == "all") {
+            let mut all = HashSet::new();
+            all.insert(OutputType::Valid);
+            all.insert(OutputType::Failed);
+            all.insert(OutputType::Publisher);
+            all.insert(OutputType::Crossref);
+            all.insert(OutputType::Mined);
+            return Ok(all);
+        }
+
+        let mut outputs = HashSet::new();
+        outputs.insert(OutputType::Valid);
+        outputs.insert(OutputType::Failed);
+
+        if self.provenance.is_empty() {
+            outputs.insert(OutputType::Publisher);
+            outputs.insert(OutputType::Crossref);
+            outputs.insert(OutputType::Mined);
+        } else {
+            for prov in &self.provenance {
+                match prov.to_lowercase().as_str() {
+                    "publisher" => {
+                        outputs.insert(OutputType::Publisher);
+                    }
+                    "crossref" => {
+                        outputs.insert(OutputType::Crossref);
+                    }
+                    "mined" => {
+                        outputs.insert(OutputType::Mined);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(outputs)
+    }
+
+    /// Check if a provenance should be included based on the filter
+    pub fn should_include_provenance(&self, provenance: &str) -> bool {
+        if self.provenance.is_empty() {
+            return true;
+        }
+        self.provenance
+            .iter()
+            .any(|p| p.to_lowercase() == provenance.to_lowercase())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_output_type_from_str() {
+        assert_eq!("valid".parse::<OutputType>().unwrap(), OutputType::Valid);
+        assert_eq!("failed".parse::<OutputType>().unwrap(), OutputType::Failed);
+        assert_eq!(
+            "publisher".parse::<OutputType>().unwrap(),
+            OutputType::Publisher
+        );
+        assert_eq!(
+            "crossref".parse::<OutputType>().unwrap(),
+            OutputType::Crossref
+        );
+        assert_eq!("mined".parse::<OutputType>().unwrap(), OutputType::Mined);
+        assert!("invalid".parse::<OutputType>().is_err());
+    }
+
+    #[test]
+    fn test_output_type_case_insensitive() {
+        assert_eq!("VALID".parse::<OutputType>().unwrap(), OutputType::Valid);
+        assert_eq!("Valid".parse::<OutputType>().unwrap(), OutputType::Valid);
+    }
+
+    #[test]
+    fn test_outputs_all_alias() {
+        let args = PipelineArgs {
+            input: "test.tar.gz".to_string(),
+            arxiv_records: None,
+            arxiv_fst: None,
+            provenance: vec![],
+            outputs: vec!["all".to_string()],
+            output_dir: None,
+            partitions_dir: None,
+            log_level: "INFO".to_string(),
+            keep_intermediates: false,
+            temp_dir: None,
+            batch_size: 5000000,
+            resume: false,
+            checkpoint_interval: 50,
+        };
+        let outputs = args.parse_outputs().unwrap();
+        assert!(outputs.contains(&OutputType::Valid));
+        assert!(outputs.contains(&OutputType::Failed));
+        assert!(outputs.contains(&OutputType::Publisher));
+        assert!(outputs.contains(&OutputType::Crossref));
+        assert!(outputs.contains(&OutputType::Mined));
+    }
+}

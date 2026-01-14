@@ -1,0 +1,76 @@
+[package]
+name = "crossref-citation-extraction"
+version = "2.0.0"
+edition = "2021"
+description = "CLI for extracting, inverting, and validating DOI references from Crossref data"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Compression
+flate2 = { version = "1.1", features = ["zlib-ng"], default-features = false }
+tar = "0.4"
+
+# Parallelism (sync)
+rayon = "1.10"
+crossbeam-channel = "0.5"
+num_cpus = "1.16"
+
+# Regex
+regex = "1.10"
+lazy_static = "1.4"
+
+# DataFrame processing (vectorized operations)
+polars = { version = "0.46", features = [
+    "lazy",
+    "parquet",
+    "regex",
+    "strings",
+    "streaming",
+    "dtype-struct",
+    "concat_str",
+    "list_eval",
+] }
+
+# Logging
+log = "0.4"
+simple_logger = "5.0"
+
+# Progress bars
+indicatif = "0.17"
+
+# Time
+time = "0.3"
+
+# Error handling
+anyhow = "1.0"
+
+# UUID for temp file naming
+uuid = { version = "1.0", features = ["v4"] }
+
+# Memory-efficient string set
+fst = "0.4"
+memmap2 = "0.9"
+
+# Parquet metadata reading (for row counts without loading data)
+parquet = { version = "53", default-features = false }
+
+# Directory traversal
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "extraction_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
