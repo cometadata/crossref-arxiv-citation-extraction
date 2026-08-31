@@ -116,8 +116,10 @@ pub struct PipelineArgs {
     #[arg(long, default_value = "false")]
     pub resume: bool,
 
-    /// Checkpoint interval: save progress every N partitions during aggregation
-    #[arg(long, default_value = "50")]
+    /// Checkpoint interval: save progress every N partitions during aggregation.
+    /// Values > 1 widen the window in which a crash duplicates already-written
+    /// partitions on resume; 0 disables checkpointing.
+    #[arg(long, default_value = "1")]
     pub checkpoint_interval: usize,
 }
 
@@ -191,7 +193,7 @@ mod tests {
             temp_dir: None,
             batch_size: 5000000,
             resume: false,
-            checkpoint_interval: 50,
+            checkpoint_interval: 1,
         }
     }
 
@@ -225,5 +227,12 @@ mod tests {
             .parse_outputs()
             .unwrap_err();
         assert!(err.contains("bogus"));
+    }
+
+    #[test]
+    fn test_checkpoint_interval_defaults_to_one() {
+        use clap::Parser;
+        let args = PipelineArgs::parse_from(["prog", "--input", "x.tar.gz"]);
+        assert_eq!(args.checkpoint_interval, 1);
     }
 }

@@ -365,7 +365,9 @@ fn flush_all_writers(
 /// * `arxiv_index` - Optional FST index for validation. If None, all records go to failed output.
 /// * `outputs` - Paths for output files (valid, failed, and provenance-split files)
 /// * `resume` - If true, resume from checkpoint if available
-/// * `checkpoint_interval` - Save checkpoint every N partitions (0 = disabled)
+/// * `checkpoint_interval` - Save checkpoint every N partitions (0 = disabled).
+///   Note: partitions completed after the last checkpoint are re-appended on
+///   resume; interval 1 bounds that duplication window to one partition.
 ///
 /// # Returns
 ///

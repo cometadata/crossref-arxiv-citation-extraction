@@ -445,7 +445,7 @@ mod tests {
             temp_dir: None,
             batch_size: 5000000,
             resume: false,
-            checkpoint_interval: 50,
+            checkpoint_interval: 1,
         }
     }
 
