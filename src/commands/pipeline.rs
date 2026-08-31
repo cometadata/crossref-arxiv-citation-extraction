@@ -326,7 +326,13 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
             }
         }
 
-        let json = entry.json;
+        let json: Value = match serde_json::from_slice(&entry.bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to parse JSON in {}: {}", entry.filename, e);
+                continue;
+            }
+        };
 
         if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
             for item in items {

@@ -3,19 +3,16 @@
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use log::info;
-use serde_json::Value;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 use tar::Archive;
 
 use super::CrossrefInput;
 
-/// A single entry from a Crossref source (filename + parsed JSON)
+/// A single entry from a Crossref source (filename + raw JSON bytes).
 pub struct CrossrefEntry {
-    #[allow(dead_code)]
     pub filename: String,
-    pub json: Value,
+    pub bytes: Vec<u8>,
 }
 
 /// Trait for iterating over Crossref JSON files
@@ -100,15 +97,13 @@ impl Iterator for TarGzSource {
             }
 
             let filename = path_str.to_string();
-            let reader = BufReader::new(entry);
-
-            match serde_json::from_reader(reader) {
-                Ok(json) => return Some(Ok(CrossrefEntry { filename, json })),
-                Err(e) => {
-                    log::warn!("Failed to parse JSON in {}: {}", filename, e);
-                    continue;
-                }
+            let mut entry = entry;
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            use std::io::Read;
+            if let Err(e) = entry.read_to_end(&mut bytes) {
+                return Some(Err(e.into()));
             }
+            return Some(Ok(CrossrefEntry { filename, bytes }));
         }
     }
 }
@@ -166,18 +161,9 @@ impl Iterator for DirectorySource {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) => return Some(Err(e.into())),
-        };
-
-        let reader = BufReader::new(file);
-        match serde_json::from_reader(reader) {
-            Ok(json) => Some(Ok(CrossrefEntry { filename, json })),
-            Err(e) => {
-                log::warn!("Failed to parse JSON in {}: {}", filename, e);
-                self.next() // Skip invalid files
-            }
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(Ok(CrossrefEntry { filename, bytes })),
+            Err(e) => Some(Err(e.into())),
         }
     }
 }
@@ -209,14 +195,8 @@ impl Iterator for SingleJsonSource {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) => return Some(Err(e.into())),
-        };
-
-        let reader = BufReader::new(file);
-        match serde_json::from_reader(reader) {
-            Ok(json) => Some(Ok(CrossrefEntry { filename, json })),
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(Ok(CrossrefEntry { filename, bytes })),
             Err(e) => Some(Err(e.into())),
         }
     }
@@ -262,7 +242,8 @@ mod tests {
 
         let entry = source.next().unwrap().unwrap();
         assert_eq!(entry.filename, "0.json");
-        assert!(entry.json.get("items").is_some());
+        let v: serde_json::Value = serde_json::from_slice(&entry.bytes).unwrap();
+        assert!(v.get("items").is_some());
     }
 
     #[test]
@@ -290,6 +271,9 @@ mod tests {
         // Should be sorted by filename
         assert_eq!(entries[0].as_ref().unwrap().filename, "0.json");
         assert_eq!(entries[1].as_ref().unwrap().filename, "1.json");
+        let v: serde_json::Value =
+            serde_json::from_slice(&entries[0].as_ref().unwrap().bytes).unwrap();
+        assert!(v.get("items").is_some());
     }
 
     #[test]
@@ -302,7 +286,8 @@ mod tests {
         let mut source = open_crossref_source(input).unwrap();
 
         let entry = source.next().unwrap().unwrap();
-        assert!(entry.json.get("items").is_some());
+        let v: serde_json::Value = serde_json::from_slice(&entry.bytes).unwrap();
+        assert!(v.get("items").is_some());
         assert!(source.next().is_none());
     }
 
