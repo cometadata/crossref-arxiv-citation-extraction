@@ -40,7 +40,12 @@ pub fn visit_crossref_entries(
                     continue;
                 }
                 let filename = path_str.to_string();
-                let mut bytes = Vec::with_capacity(entry.size() as usize);
+                // The size comes from the tar header, so it is only a hint: a
+                // corrupt one could otherwise ask for a huge allocation up
+                // front. read_to_end grows past the hint when the entry is
+                // genuinely larger.
+                const MAX_PREALLOC: usize = 16 * 1024 * 1024;
+                let mut bytes = Vec::with_capacity((entry.size() as usize).min(MAX_PREALLOC));
                 entry.read_to_end(&mut bytes)?;
                 f(CrossrefEntry { filename, bytes })?;
             }

@@ -425,33 +425,43 @@ pub fn aggregate_and_validate(
     let mut valid_writer = outputs
         .valid
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode))
-        .transpose()
-        .context("Failed to open valid output")?;
+        .map(|p| {
+            open_output_writer(p, append_mode)
+                .with_context(|| format!("Failed to open valid output {}", p.display()))
+        })
+        .transpose()?;
     let mut failed_writer = outputs
         .failed
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode))
-        .transpose()
-        .context("Failed to open failed output")?;
+        .map(|p| {
+            open_output_writer(p, append_mode)
+                .with_context(|| format!("Failed to open failed output {}", p.display()))
+        })
+        .transpose()?;
     let mut publisher_writer = outputs
         .publisher
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode))
-        .transpose()
-        .context("Failed to open publisher output")?;
+        .map(|p| {
+            open_output_writer(p, append_mode)
+                .with_context(|| format!("Failed to open publisher output {}", p.display()))
+        })
+        .transpose()?;
     let mut crossref_writer = outputs
         .crossref
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode))
-        .transpose()
-        .context("Failed to open crossref output")?;
+        .map(|p| {
+            open_output_writer(p, append_mode)
+                .with_context(|| format!("Failed to open crossref output {}", p.display()))
+        })
+        .transpose()?;
     let mut mined_writer = outputs
         .mined
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode))
-        .transpose()
-        .context("Failed to open mined output")?;
+        .map(|p| {
+            open_output_writer(p, append_mode)
+                .with_context(|| format!("Failed to open mined output {}", p.display()))
+        })
+        .transpose()?;
 
     // Clean up any stale temp files from interrupted runs
     cleanup_stale_temp_files(partition_dir)?;
@@ -641,8 +651,16 @@ fn process_partition_inmemory(
         .filter(col("citing_doi").neq(col("cited_id")))
         .collect()?;
 
+    // Segment row order depends on how the parallel extraction interleaved
+    // writes, so the aggregated lists would otherwise vary run to run. Sorting
+    // on the merge key first makes cited_by deterministic and matches the
+    // ordering the external-sort path produces.
     let grouped = merged
         .lazy()
+        .sort(
+            ["cited_id", "citing_doi", "ref_index"],
+            SortMultipleOptions::default(),
+        )
         .group_by([col("cited_id")])
         .agg([col("citing_doi"), col("provenance"), col("ref_json")])
         .collect()?;
@@ -863,6 +881,22 @@ mod tests {
     use crate::streaming::{PartitionRow, SegmentedPartitionWriter};
     use tempfile::tempdir;
 
+    /// The external-sort path writes `_sorted_<n>.parquet` temp files; none of
+    /// them may survive a completed partition.
+    fn assert_no_sorted_temp_files(partition_path: &Path) {
+        let leftovers: Vec<String> = fs::read_dir(partition_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.starts_with("_sorted"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stale sort temp files left behind: {:?}",
+            leftovers
+        );
+    }
+
     #[test]
     fn test_aggregate_and_validate() {
         let dir = tempdir().unwrap();
@@ -928,6 +962,85 @@ mod tests {
         let valid_content = std::fs::read_to_string(&valid_output).unwrap();
         assert!(valid_content.contains("10.1234/cited"));
         assert!(valid_content.contains("citation_count\":2"));
+    }
+
+    /// The in-memory path must not inherit the (parallel, arbitrary) segment
+    /// order: cited_by has to come out in merge-key order, like the
+    /// external-sort path.
+    #[test]
+    fn test_inmemory_partition_orders_citations_deterministically() {
+        use polars::prelude::*;
+
+        let dir = tempdir().unwrap();
+        let partition_path = dir.path().join("partitions/10.1234");
+        fs::create_dir_all(&partition_path).unwrap();
+        let valid_output = dir.path().join("valid.jsonl");
+
+        // Rows land in whatever order the parallel extraction produced, both
+        // within a segment and across segments.
+        for (seg_num, citers) in [
+            (0, ["10.1111/c", "10.1111/a"]),
+            (1, ["10.1111/d", "10.1111/b"]),
+        ] {
+            let mut df = DataFrame::new(vec![
+                Column::new("citing_doi".into(), &citers),
+                Column::new("ref_index".into(), &[0u32, 0u32]),
+                Column::new("cited_id".into(), &["10.1234/target", "10.1234/target"]),
+                Column::new("provenance".into(), &["mined", "mined"]),
+                Column::new("ref_json".into(), &[r#"{"t": 1}"#, r#"{"t": 2}"#]),
+            ])
+            .unwrap();
+            let path = partition_path.join(format!("segment_{:04}.parquet", seg_num));
+            ParquetWriter::new(File::create(&path).unwrap())
+                .finish(&mut df)
+                .unwrap();
+        }
+
+        // Feed them in reverse discovery order too, so only the sort can fix it.
+        let mut segments: Vec<_> = (0..2)
+            .map(|i| partition_path.join(format!("segment_{:04}.parquet", i)))
+            .collect();
+        segments.reverse();
+
+        let fst_path = dir.path().join("test.fst");
+        {
+            use crate::index::FstIndexBuilder;
+            let mut builder = FstIndexBuilder::new(&fst_path).unwrap();
+            builder.insert("10.1234/target").unwrap();
+            builder.finish().unwrap();
+        }
+        let index = FstIndex::load(&fst_path).unwrap();
+
+        let mut valid_writer = Some(BufWriter::new(File::create(&valid_output).unwrap()));
+        let mut stats = AggregationStats::default();
+
+        process_partition_inmemory(
+            &segments,
+            Some(&index),
+            &mut valid_writer,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut stats,
+        )
+        .unwrap();
+        valid_writer.as_mut().unwrap().flush().unwrap();
+
+        let content = fs::read_to_string(&valid_output).unwrap();
+        let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let order: Vec<&str> = record["cited_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["doi"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(record["citation_count"], 4);
+        assert_eq!(
+            order,
+            vec!["10.1111/a", "10.1111/b", "10.1111/c", "10.1111/d"]
+        );
     }
 
     #[test]
@@ -1056,8 +1169,8 @@ mod tests {
 
         valid_writer.as_mut().unwrap().flush().unwrap();
 
-        // Verify temp file was cleaned up
-        assert!(!partition_path.join("_sorted.parquet").exists());
+        // Verify temp files were cleaned up
+        assert_no_sorted_temp_files(&partition_path);
 
         // Verify output
         let content = fs::read_to_string(&valid_output).unwrap();
@@ -1137,8 +1250,8 @@ mod tests {
 
         let stats = aggregate_and_validate(&partition_dir, Some(&index), &outputs, false, 0).unwrap();
 
-        // Verify temp file was cleaned up
-        assert!(!partition_path.join("_sorted.parquet").exists());
+        // Verify temp files were cleaned up
+        assert_no_sorted_temp_files(&partition_path);
 
         // Verify aggregation worked
         assert_eq!(stats.valid_count, 1);

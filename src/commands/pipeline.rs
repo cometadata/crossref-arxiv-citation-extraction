@@ -421,6 +421,50 @@ fn extract_file(
     result
 }
 
+/// True when `partition_dir` holds segments under the pre-upgrade `10.48550`
+/// partition, i.e. it was written before arXiv DOIs were keyed on the ID.
+///
+/// The current scheme can never create this partition: `partition_key` strips
+/// the `10.48550/arxiv.` prefix and keys on the ID (see `streaming::partition_key`),
+/// so a `10.48550` directory holding segments is unambiguously a legacy run.
+fn has_legacy_arxiv_partition(partition_dir: &Path) -> bool {
+    const LEGACY_ARXIV_PARTITION: &str = "10.48550";
+
+    let legacy_dir = partition_dir.join(LEGACY_ARXIV_PARTITION);
+    let Ok(entries) = fs::read_dir(&legacy_dir) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|entry| {
+        let path = entry.path();
+        path.extension().and_then(|e| e.to_str()) == Some("parquet")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("segment_"))
+    })
+}
+
+/// Reject resuming into a partition directory written by an older version.
+///
+/// Resuming skips the files the old run already handled, so their rows stay in
+/// the legacy `10.48550` partition while new rows land in ID-keyed partitions.
+/// Aggregation walks every partition directory, so each cited work would then
+/// be emitted twice, with its citations split across the two records.
+fn ensure_partition_scheme_current(partition_dir: &Path) -> Result<()> {
+    if has_legacy_arxiv_partition(partition_dir) {
+        anyhow::bail!(
+            "Partition directory {} predates the arXiv-ID partitioning scheme \
+             (it holds segments under `10.48550/`). Resuming into it would leave \
+             already-extracted rows in the old partition while new rows go to \
+             ID-keyed partitions, and aggregation would emit duplicate, fragmented \
+             records. Delete the partition directory and re-run without --resume \
+             to start fresh.",
+            partition_dir.display()
+        );
+    }
+    Ok(())
+}
+
 fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<()> {
     let flush_threshold = (args.batch_size / FLUSH_THRESHOLD_DIVISOR).max(10000);
     let mut partition_writer = SegmentedPartitionWriter::new(partition_dir, flush_threshold)?;
@@ -429,6 +473,7 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
 
     let checkpoint_path = partition_dir.join("extraction.checkpoint");
     let mut checkpoint = if args.resume {
+        ensure_partition_scheme_current(partition_dir)?;
         let cp = ExtractionCheckpoint::new(&checkpoint_path)?;
         if cp.completed_count() > 0 {
             info!(
@@ -526,18 +571,21 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
             if !file_result.parse_failed {
                 pending_files.push(file_result.filename);
                 files_processed += 1;
+                // Logged only on the iteration that moved the counter: outside
+                // this branch it would fire once at zero and then again for
+                // every parse failure while the counter sat on a multiple.
+                if files_processed.is_multiple_of(100) {
+                    info!(
+                        "Progress: {} files, {} items, {} refs extracted",
+                        files_processed, items_processed, refs_extracted
+                    );
+                }
             }
 
             // Periodic durable commit only matters when checkpointing; without
             // --resume, segment flushing stays purely threshold-driven.
             if checkpoint.is_some() && pending_files.len() >= CHECKPOINT_FILES_INTERVAL {
                 commit_progress(&mut partition_writer, &mut checkpoint, &mut pending_files)?;
-            }
-            if files_processed.is_multiple_of(100) {
-                info!(
-                    "Progress: {} files, {} items, {} refs extracted",
-                    files_processed, items_processed, refs_extracted
-                );
             }
         }
 
@@ -919,5 +967,66 @@ mod tests {
         drop(checkpoint);
         let reloaded = ExtractionCheckpoint::new(&cp_path).unwrap();
         assert!(reloaded.is_completed("file1.json"));
+    }
+
+    /// Lay down a partition directory holding one segment file in `partition`.
+    fn write_partition_segment(partition_dir: &Path, partition: &str) {
+        let path = partition_dir.join(partition);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("segment_00000.parquet"), b"segment bytes").unwrap();
+    }
+
+    #[test]
+    fn test_detects_legacy_arxiv_partition_layout() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        // Pre-upgrade layout: every arXiv DOI keyed on the 10.48550 prefix.
+        let legacy = dir.path().join("legacy");
+        write_partition_segment(&legacy, "10.48550");
+        assert!(has_legacy_arxiv_partition(&legacy));
+
+        // Current layout: arXiv IDs key their own partitions.
+        let current = dir.path().join("current");
+        write_partition_segment(&current, "2403");
+        write_partition_segment(&current, "hep-");
+        assert!(!has_legacy_arxiv_partition(&current));
+
+        // A 10.48550 directory with no segments is not a legacy extraction.
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(empty.join("10.48550")).unwrap();
+        assert!(!has_legacy_arxiv_partition(&empty));
+
+        // Missing partition directory entirely.
+        assert!(!has_legacy_arxiv_partition(&dir.path().join("absent")));
+    }
+
+    #[test]
+    fn test_resume_rejects_legacy_partition_layout() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        // A minimal but valid Crossref input directory.
+        let input_dir = dir.path().join("input");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("0.json"), r#"{"items": []}"#).unwrap();
+
+        let partition_dir = dir.path().join("partitions");
+        write_partition_segment(&partition_dir, "10.48550");
+        fs::write(partition_dir.join("extraction.checkpoint"), "0.json\n").unwrap();
+
+        let mut args = default_args();
+        args.input = input_dir.to_string_lossy().to_string();
+        args.resume = true;
+
+        let err = run_scalable_extraction(&args, &partition_dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("predates the arXiv-ID partitioning scheme"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("--resume"), "unexpected error: {msg}");
     }
 }

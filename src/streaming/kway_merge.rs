@@ -123,9 +123,15 @@ where
     F: FnMut(MergeRow) -> Result<()>,
 {
     // A zero-row chunk reads nothing, which the EOF check would misread as
-    // exhaustion — silently emitting no rows at all.
-    if chunk_rows == 0 {
-        anyhow::bail!("chunk_rows must be > 0");
+    // exhaustion — silently emitting no rows at all. A chunk larger than u32
+    // cannot be passed to the parquet slice below without truncating, and a
+    // multiple of 2^32 would truncate to zero: the same silent-EOF failure.
+    if chunk_rows == 0 || chunk_rows > u32::MAX as usize {
+        anyhow::bail!(
+            "chunk_rows must be > 0 and <= {} (got {})",
+            u32::MAX,
+            chunk_rows
+        );
     }
 
     let mut cursors: Vec<SegmentCursor> = segments
@@ -283,6 +289,21 @@ mod tests {
         write_segment(&a, &[("id1", "c", 0)]);
 
         let err = merge_sorted_segments(&[a], 0, |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("chunk_rows must be > 0"));
+    }
+
+    /// A chunk size past u32 would be truncated by the parquet slice below
+    /// (and a multiple of 2^32 truncates to 0, reading as instant EOF), so it
+    /// must be rejected rather than silently narrowed.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_oversized_chunk_rows_is_rejected() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.parquet");
+        write_segment(&a, &[("id1", "c", 0)]);
+
+        let too_big = u32::MAX as usize + 1;
+        let err = merge_sorted_segments(&[a], too_big, |_| Ok(())).unwrap_err();
         assert!(err.to_string().contains("chunk_rows must be > 0"));
     }
 

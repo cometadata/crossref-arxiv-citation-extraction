@@ -2,6 +2,8 @@
 name = "crossref-citation-extraction"
 version = "2.0.0"
 edition = "2021"
+# std::sync::LazyLock needs 1.80; unsigned `is_multiple_of` needs 1.87.
+rust-version = "1.87"
 description = "CLI for extracting, inverting, and validating DOI references from Crossref data"
 
 [dependencies]
