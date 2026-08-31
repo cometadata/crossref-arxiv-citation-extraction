@@ -382,3 +382,77 @@ fn test_batched_processing_for_large_partitions() {
         "Should have 250 citations"
     );
 }
+
+#[test]
+fn test_intermediates_removed_unless_kept() {
+    let dir = tempdir().unwrap();
+    let crossref_dir = dir.path().join("crossref_dir");
+    fs::create_dir_all(&crossref_dir).unwrap();
+    fs::write(
+        crossref_dir.join("0.json"),
+        serde_json::to_string(&serde_json::json!({
+            "items": [{
+                "DOI": "10.1111/citing1",
+                "reference": [{"DOI": "10.48550/arXiv.2403.99999", "doi-asserted-by": "publisher"}]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let fst_path = dir.path().join("arxiv.fst");
+    {
+        let mut builder = FstIndexBuilder::new(&fst_path).unwrap();
+        builder.insert("10.48550/arxiv.2403.99999").unwrap();
+        builder.finish().unwrap();
+    }
+
+    // Run 1: no flag -> partition dir removed after success.
+    let partitions_a = dir.path().join("partitions_a");
+    let status = Command::new(env!("CARGO_BIN_EXE_crossref-citation-extraction"))
+        .args([
+            "pipeline",
+            "--input",
+            crossref_dir.to_str().unwrap(),
+            "--outputs",
+            "valid",
+            "--output-dir",
+            dir.path().to_str().unwrap(),
+            "--arxiv-fst",
+            fst_path.to_str().unwrap(),
+            "--temp-dir",
+            partitions_a.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        !partitions_a.exists(),
+        "intermediates should be removed by default"
+    );
+
+    // Run 2: --keep-intermediates -> partition dir kept.
+    let partitions_b = dir.path().join("partitions_b");
+    let status = Command::new(env!("CARGO_BIN_EXE_crossref-citation-extraction"))
+        .args([
+            "pipeline",
+            "--input",
+            crossref_dir.to_str().unwrap(),
+            "--outputs",
+            "valid",
+            "--output-dir",
+            dir.path().to_str().unwrap(),
+            "--arxiv-fst",
+            fst_path.to_str().unwrap(),
+            "--temp-dir",
+            partitions_b.to_str().unwrap(),
+            "--keep-intermediates",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        partitions_b.exists(),
+        "--keep-intermediates should preserve them"
+    );
+}

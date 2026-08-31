@@ -233,6 +233,25 @@ fn run_scalable_pipeline(args: &PipelineArgs) -> Result<()> {
         info!("Output mined: {}", p.display());
     }
 
+    if skip_extraction || args.keep_intermediates {
+        info!(
+            "Intermediate partitions kept at: {}",
+            partition_dir.display()
+        );
+    } else {
+        info!(
+            "Removing intermediate partition directory: {}",
+            partition_dir.display()
+        );
+        if let Err(e) = fs::remove_dir_all(&partition_dir) {
+            warn!(
+                "Failed to remove intermediate directory {}: {}",
+                partition_dir.display(),
+                e
+            );
+        }
+    }
+
     Ok(())
 }
 
