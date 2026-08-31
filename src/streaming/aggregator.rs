@@ -78,6 +78,21 @@ fn sort_single_segment(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// An output record, serialized directly from borrowed citation values so the
+/// `cited_by` array never has to be cloned or concatenated.
+#[derive(serde::Serialize)]
+struct CitedRecordOut<'a> {
+    doi: &'a str,
+    citation_count: usize,
+    cited_by: Vec<&'a serde_json::Value>,
+}
+
+fn write_jsonl_record(w: &mut BufWriter<File>, record: &CitedRecordOut<'_>) -> Result<()> {
+    serde_json::to_writer(&mut *w, record)?;
+    w.write_all(b"\n")?;
+    Ok(())
+}
+
 /// Flush a group of citations for a single cited DOI to output files.
 fn flush_group(
     cited_id: &str,
@@ -122,27 +137,24 @@ fn flush_group(
         publisher_citations.len() + crossref_citations.len() + mined_citations.len();
     stats.total_citations += citation_count;
 
-    let all_cited_by: Vec<_> = publisher_citations
-        .iter()
-        .chain(crossref_citations.iter())
-        .chain(mined_citations.iter())
-        .cloned()
-        .collect();
-
-    let record = serde_json::json!({
-        "doi": cited_id,
-        "citation_count": citation_count,
-        "cited_by": all_cited_by
-    });
+    let record = CitedRecordOut {
+        doi: cited_id,
+        citation_count,
+        cited_by: publisher_citations
+            .iter()
+            .chain(crossref_citations.iter())
+            .chain(mined_citations.iter())
+            .collect(),
+    };
 
     if is_valid {
         if let Some(ref mut w) = valid_writer {
-            writeln!(w, "{}", record)?;
+            write_jsonl_record(w, &record)?;
         }
         stats.valid_count += 1;
     } else {
         if let Some(ref mut w) = failed_writer {
-            writeln!(w, "{}", record)?;
+            write_jsonl_record(w, &record)?;
         }
         stats.failed_count += 1;
     }
@@ -696,22 +708,25 @@ fn write_grouped_results(
             )?;
         }
 
-        let all_cited_by = grouped.into_all_citations();
-
-        let record = serde_json::json!({
-            "doi": cited_id,
-            "citation_count": citation_count,
-            "cited_by": all_cited_by
-        });
+        let record = CitedRecordOut {
+            doi: cited_id,
+            citation_count,
+            cited_by: grouped
+                .publisher
+                .iter()
+                .chain(grouped.crossref.iter())
+                .chain(grouped.mined.iter())
+                .collect(),
+        };
 
         if is_valid {
             if let Some(ref mut w) = valid_writer {
-                writeln!(w, "{}", record)?;
+                write_jsonl_record(w, &record)?;
             }
             stats.valid_count += 1;
         } else {
             if let Some(ref mut w) = failed_writer {
-                writeln!(w, "{}", record)?;
+                write_jsonl_record(w, &record)?;
             }
             stats.failed_count += 1;
         }
@@ -733,37 +748,37 @@ fn write_provenance_outputs_direct(
     stats: &mut AggregationStats,
 ) -> Result<()> {
     if !publisher_citations.is_empty() {
-        let prov_record = serde_json::json!({
-            "doi": cited_id,
-            "citation_count": publisher_citations.len(),
-            "cited_by": publisher_citations
-        });
         if let Some(ref mut w) = publisher_writer {
-            writeln!(w, "{}", prov_record)?;
+            let record = CitedRecordOut {
+                doi: cited_id,
+                citation_count: publisher_citations.len(),
+                cited_by: publisher_citations.iter().collect(),
+            };
+            write_jsonl_record(w, &record)?;
         }
         stats.publisher_citations += publisher_citations.len();
     }
 
     if !crossref_citations.is_empty() {
-        let prov_record = serde_json::json!({
-            "doi": cited_id,
-            "citation_count": crossref_citations.len(),
-            "cited_by": crossref_citations
-        });
         if let Some(ref mut w) = crossref_writer {
-            writeln!(w, "{}", prov_record)?;
+            let record = CitedRecordOut {
+                doi: cited_id,
+                citation_count: crossref_citations.len(),
+                cited_by: crossref_citations.iter().collect(),
+            };
+            write_jsonl_record(w, &record)?;
         }
         stats.crossref_citations += crossref_citations.len();
     }
 
     if !mined_citations.is_empty() {
-        let prov_record = serde_json::json!({
-            "doi": cited_id,
-            "citation_count": mined_citations.len(),
-            "cited_by": mined_citations
-        });
         if let Some(ref mut w) = mined_writer {
-            writeln!(w, "{}", prov_record)?;
+            let record = CitedRecordOut {
+                doi: cited_id,
+                citation_count: mined_citations.len(),
+                cited_by: mined_citations.iter().collect(),
+            };
+            write_jsonl_record(w, &record)?;
         }
         stats.mined_citations += mined_citations.len();
     }
@@ -789,14 +804,6 @@ impl GroupedCitationsByProvenance {
 
     fn total_count(&self) -> usize {
         self.publisher.len() + self.crossref.len() + self.mined.len()
-    }
-
-    fn into_all_citations(self) -> Vec<serde_json::Value> {
-        let mut all = Vec::with_capacity(self.total_count());
-        all.extend(self.publisher);
-        all.extend(self.crossref);
-        all.extend(self.mined);
-        all
     }
 }
 

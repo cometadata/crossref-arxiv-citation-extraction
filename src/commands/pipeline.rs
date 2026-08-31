@@ -94,7 +94,9 @@ fn has_searchable_content(reference: &RefFields<'_>) -> bool {
 
 #[inline]
 fn quick_arxiv_likely(text: &str) -> bool {
-    text.to_ascii_lowercase().contains("arxiv")
+    text.as_bytes()
+        .windows(5)
+        .any(|w| w.eq_ignore_ascii_case(b"arxiv"))
 }
 
 fn build_search_text(reference: &RefFields<'_>, buffer: &mut String) -> bool {
@@ -721,6 +723,7 @@ mod tests {
         assert!(quick_arxiv_likely("See arXiv:2403.12345"));
         assert!(quick_arxiv_likely("ARXIV paper reference"));
         assert!(quick_arxiv_likely("Available at arxiv.org/abs/2403.12345"));
+        assert!(quick_arxiv_likely("See ArXiV preprint")); // mixed case, no colon
 
         // Does not contain arXiv
         assert!(!quick_arxiv_likely("Just a regular paper"));

@@ -64,19 +64,18 @@ impl SegmentBuffer {
         self.ref_jsons.clear();
     }
 
-    fn to_dataframe(&self) -> Result<DataFrame> {
-        DataFrame::new(vec![
-            Column::new("citing_doi".into(), &self.citing_dois),
-            Column::new("ref_index".into(), &self.ref_indices),
-            Column::new("cited_id".into(), &self.cited_ids),
-            Column::new("provenance".into(), &self.provenances),
-            Column::new("ref_json".into(), &self.ref_jsons),
+    /// Write the buffered rows to a parquet segment, consuming the buffers
+    /// (they are left empty, so no separate `clear()` is needed).
+    fn write_parquet(&mut self, path: &Path) -> Result<()> {
+        let mut df = DataFrame::new(vec![
+            Column::new("citing_doi".into(), std::mem::take(&mut self.citing_dois)),
+            Column::new("ref_index".into(), std::mem::take(&mut self.ref_indices)),
+            Column::new("cited_id".into(), std::mem::take(&mut self.cited_ids)),
+            Column::new("provenance".into(), std::mem::take(&mut self.provenances)),
+            Column::new("ref_json".into(), std::mem::take(&mut self.ref_jsons)),
         ])
-        .map_err(|e| anyhow::anyhow!("Failed to create DataFrame: {}", e))
-    }
+        .map_err(|e| anyhow::anyhow!("Failed to create DataFrame: {}", e))?;
 
-    fn write_parquet(&self, path: &Path) -> Result<()> {
-        let mut df = self.to_dataframe()?;
         let file = File::create(path)
             .with_context(|| format!("Failed to create segment file: {:?}", path))?;
 
@@ -156,7 +155,6 @@ impl SegmentedPartitionWriter {
 
         *segment_num += 1;
         self.total_rows_written += rows_in_segment;
-        buffer.clear();
 
         Ok(())
     }
