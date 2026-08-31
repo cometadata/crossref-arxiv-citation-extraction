@@ -8,16 +8,21 @@ pub use checkpoint::ExtractionCheckpoint;
 pub use segmented_writer::{PartitionRow, SegmentedPartitionWriter};
 
 /// Extract partition key from a DOI or arXiv ID.
-/// For DOIs: uses prefix (e.g., "10.1234" -> "10.1234")
-/// For arXiv IDs: uses first 4 chars
+/// arXiv DOIs (10.48550/arXiv.<id>) key on the arXiv ID portion so the
+/// corpus spreads across many partitions instead of one.
+/// Other DOIs use their prefix; bare arXiv IDs use their first 4 chars.
 pub fn partition_key(id: &str) -> String {
-    if id.starts_with("10.") {
-        if let Some(slash_pos) = id.find('/') {
-            return id[..slash_pos].to_lowercase();
+    const ARXIV_DOI_PREFIX: &str = "10.48550/arxiv.";
+    let lower = id.to_lowercase();
+    let effective = lower.strip_prefix(ARXIV_DOI_PREFIX).unwrap_or(&lower);
+
+    if effective.starts_with("10.") {
+        if let Some(slash_pos) = effective.find('/') {
+            return effective[..slash_pos].to_string();
         }
     }
 
-    id.to_lowercase()
+    effective
         .chars()
         .take(4)
         .map(|c| if c == '/' { '_' } else { c })
@@ -51,10 +56,17 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_key_doi_format() {
+    fn test_partition_key_arxiv_doi_uses_id_suffix() {
+        assert_eq!(partition_key("10.48550/arXiv.2403.12345"), "2403");
+        assert_eq!(partition_key("10.48550/arxiv.2403.12345"), "2403");
+        assert_eq!(partition_key("10.48550/arXiv.hep-ph/9901234"), "hep-");
+        assert_eq!(partition_key("10.48550/arXiv.cs/9901234"), "cs_9");
+    }
+
+    #[test]
+    fn test_partition_key_non_arxiv_doi_keeps_prefix() {
         assert_eq!(partition_key("10.1234/example"), "10.1234");
         assert_eq!(partition_key("10.5555/abcd.1234"), "10.5555");
-        assert_eq!(partition_key("10.48550/arXiv.2403.12345"), "10.48550");
     }
 
     #[test]

@@ -314,7 +314,7 @@ fn test_batched_processing_for_large_partitions() {
         partition_writer.flush_all().unwrap();
     }
 
-    let partition_path = partition_dir.join("10.48550");
+    let partition_path = partition_dir.join("2403");
     let segment_count = std::fs::read_dir(&partition_path)
         .unwrap()
         .filter(|e| {

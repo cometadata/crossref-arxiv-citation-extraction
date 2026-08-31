@@ -433,17 +433,12 @@ pub fn aggregate_and_validate(
     cleanup_stale_temp_files(partition_dir)?;
 
     // Collect and sort partitions for deterministic order (important for resume)
-    // Filter to only DOI prefix directories (start with "10.")
+    // Every subdirectory is a partition; sibling files (checkpoints, arxiv.fst)
+    // are excluded by the is_dir check.
     let mut partitions: Vec<_> = fs::read_dir(partition_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("10."))
-                    .unwrap_or(false)
-        })
+        .filter(|p| p.is_dir())
         .collect();
     partitions.sort();
 
