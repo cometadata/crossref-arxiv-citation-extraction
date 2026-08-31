@@ -2,7 +2,6 @@ use anyhow::Result;
 use fst::{Set, SetBuilder};
 use log::info;
 use memmap2::Mmap;
-use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -119,16 +118,16 @@ where
     Ok(())
 }
 
-/// Build an FST index from a source of JSON records
+#[derive(serde::Deserialize)]
+struct IdRecord {
+    id: Option<String>,
+}
+
+/// Build an FST index from a source of raw JSONL records (uses the "id" field).
 #[allow(dead_code)]
-pub fn build_fst_index_from_source<I>(
-    source: I,
-    id_field: &str,
-    output_path: &Path,
-    temp_dir: &Path,
-) -> Result<()>
+pub fn build_fst_index_from_source<I>(source: I, output_path: &Path, temp_dir: &Path) -> Result<()>
 where
-    I: Iterator<Item = Result<Value>>,
+    I: Iterator<Item = Result<String>>,
 {
     info!("Building FST index from source");
     let start = Instant::now();
@@ -137,25 +136,33 @@ where
     let sorted_path = temp_dir.join("dois_sorted.txt");
 
     let mut count = 0;
+    let mut skipped = 0u64;
     {
         let mut writer = BufWriter::new(File::create(&unsorted_path)?);
         for record_result in source {
             match record_result {
-                Ok(record) => {
-                    if let Some(id) = record.get(id_field).and_then(|v| v.as_str()) {
+                Ok(line) => match serde_json::from_str::<IdRecord>(&line) {
+                    Ok(IdRecord { id: Some(id) }) => {
                         writeln!(writer, "{}", id.to_lowercase())?;
                         count += 1;
                         if count % 500_000 == 0 {
                             info!("  Extracted {} DOIs...", count);
                         }
                     }
-                }
+                    Ok(IdRecord { id: None }) => skipped += 1,
+                    Err(_) => skipped += 1,
+                },
                 Err(e) => {
-                    log::warn!("Failed to parse record: {}", e);
+                    log::warn!("Failed to read record: {}", e);
+                    skipped += 1;
                 }
             }
         }
         writer.flush()?;
+    }
+
+    if skipped > 0 {
+        log::warn!("Skipped {} records without a parseable id", skipped);
     }
 
     info!("Extracted {} DOIs, sorting...", count);
@@ -227,7 +234,7 @@ mod tests {
         let input = DataciteInput::SingleJsonlGz(file.path().to_path_buf());
         let source = open_datacite_source(input).unwrap();
 
-        build_fst_index_from_source(source, "id", &fst_path, dir.path()).unwrap();
+        build_fst_index_from_source(source, &fst_path, dir.path()).unwrap();
 
         let index = FstIndex::load(&fst_path).unwrap();
         assert_eq!(index.len(), 3);

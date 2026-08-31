@@ -26,7 +26,7 @@ pub fn run_build_index(args: BuildIndexArgs) -> Result<()> {
 
     let input = detect_datacite_input(&args.input)?;
     let source = open_datacite_source(input)?;
-    build_fst_index_from_source(source, "id", output_path, &temp_dir)?;
+    build_fst_index_from_source(source, output_path, &temp_dir)?;
 
     info!("arXiv FST index built successfully: {}", args.output);
 

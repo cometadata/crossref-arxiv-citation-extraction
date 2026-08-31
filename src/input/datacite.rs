@@ -3,7 +3,6 @@
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use log::info;
-use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -11,8 +10,8 @@ use walkdir::WalkDir;
 
 use super::DataciteInput;
 
-/// Trait for iterating over DataCite records
-pub trait DataciteSource: Iterator<Item = Result<Value>> {}
+/// Trait for iterating over raw DataCite JSON lines
+pub trait DataciteSource: Iterator<Item = Result<String>> {}
 
 /// Open a DataCite source based on detected input type
 pub fn open_datacite_source(input: DataciteInput) -> Result<Box<dyn DataciteSource>> {
@@ -49,7 +48,7 @@ impl SingleJsonlGzSource {
 }
 
 impl Iterator for SingleJsonlGzSource {
-    type Item = Result<Value>;
+    type Item = Result<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -61,11 +60,7 @@ impl Iterator for SingleJsonlGzSource {
             if line.trim().is_empty() {
                 continue;
             }
-
-            match serde_json::from_str(&line) {
-                Ok(v) => return Some(Ok(v)),
-                Err(_) => continue, // Skip invalid lines
-            }
+            return Some(Ok(line));
         }
     }
 }
@@ -87,7 +82,7 @@ impl SingleJsonlSource {
 }
 
 impl Iterator for SingleJsonlSource {
-    type Item = Result<Value>;
+    type Item = Result<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -99,11 +94,7 @@ impl Iterator for SingleJsonlSource {
             if line.trim().is_empty() {
                 continue;
             }
-
-            match serde_json::from_str(&line) {
-                Ok(v) => return Some(Ok(v)),
-                Err(_) => continue,
-            }
+            return Some(Ok(line));
         }
     }
 }
@@ -179,7 +170,7 @@ impl FlatDirectorySource {
 }
 
 impl Iterator for FlatDirectorySource {
-    type Item = Result<Value>;
+    type Item = Result<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -193,10 +184,7 @@ impl Iterator for FlatDirectorySource {
                         if line.trim().is_empty() {
                             continue;
                         }
-                        match serde_json::from_str(&line) {
-                            Ok(v) => return Some(Ok(v)),
-                            Err(_) => continue,
-                        }
+                        return Some(Ok(line));
                     }
                     Some(Err(e)) => return Some(Err(e.into())),
                     None => {
@@ -259,7 +247,7 @@ impl NestedSnapshotSource {
 }
 
 impl Iterator for NestedSnapshotSource {
-    type Item = Result<Value>;
+    type Item = Result<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -273,10 +261,7 @@ impl Iterator for NestedSnapshotSource {
                         if line.trim().is_empty() {
                             continue;
                         }
-                        match serde_json::from_str(&line) {
-                            Ok(v) => return Some(Ok(v)),
-                            Err(_) => continue,
-                        }
+                        return Some(Ok(line));
                     }
                     Some(Err(e)) => return Some(Err(e.into())),
                     None => {
@@ -314,9 +299,13 @@ mod tests {
 
         let input = DataciteInput::SingleJsonlGz(path);
         let source = open_datacite_source(input).unwrap();
-        let records: Vec<_> = source.collect();
+        let records: Vec<Result<String>> = source.collect();
 
         assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| {
+            let line = r.as_ref().unwrap();
+            serde_json::from_str::<serde_json::Value>(line).is_ok()
+        }));
     }
 
     #[test]
@@ -333,9 +322,13 @@ mod tests {
 
         let input = DataciteInput::SingleJsonl(path);
         let source = open_datacite_source(input).unwrap();
-        let records: Vec<_> = source.collect();
+        let records: Vec<Result<String>> = source.collect();
 
         assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| {
+            let line = r.as_ref().unwrap();
+            serde_json::from_str::<serde_json::Value>(line).is_ok()
+        }));
     }
 
     #[test]
@@ -356,9 +349,13 @@ mod tests {
 
         let input = DataciteInput::FlatDirectory(flat_dir);
         let source = open_datacite_source(input).unwrap();
-        let records: Vec<_> = source.collect();
+        let records: Vec<Result<String>> = source.collect();
 
         assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|r| {
+            let line = r.as_ref().unwrap();
+            serde_json::from_str::<serde_json::Value>(line).is_ok()
+        }));
     }
 
     #[test]
@@ -384,7 +381,11 @@ mod tests {
         let input = DataciteInput::FlatDirectory(flat_dir);
         let source = open_datacite_source(input).unwrap();
         let ids: Vec<String> = source
-            .map(|r| r.unwrap()["id"].as_str().unwrap().to_string())
+            .map(|r| {
+                let line = r.unwrap();
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                v["id"].as_str().unwrap().to_string()
+            })
             .collect();
 
         // b.jsonl is skipped with a warning; a and c still arrive.
@@ -411,9 +412,13 @@ mod tests {
 
         let input = DataciteInput::NestedSnapshot(snapshot_dir);
         let source = open_datacite_source(input).unwrap();
-        let records: Vec<_> = source.collect();
+        let records: Vec<Result<String>> = source.collect();
 
         assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| {
+            let line = r.as_ref().unwrap();
+            serde_json::from_str::<serde_json::Value>(line).is_ok()
+        }));
     }
 
     #[test]
@@ -448,7 +453,11 @@ mod tests {
         let input = DataciteInput::NestedSnapshot(snapshot_dir);
         let source = open_datacite_source(input).unwrap();
         let ids: Vec<String> = source
-            .map(|r| r.unwrap()["id"].as_str().unwrap().to_string())
+            .map(|r| {
+                let line = r.unwrap();
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                v["id"].as_str().unwrap().to_string()
+            })
             .collect();
 
         assert_eq!(ids, vec!["10.1/a", "10.1/c"]);

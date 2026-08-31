@@ -296,7 +296,7 @@ fn load_or_build_arxiv_fst(args: &PipelineArgs, temp_dir: &Path) -> Result<Optio
         let fst_path = temp_dir.join("arxiv.fst");
         let input = detect_datacite_input(records_path)?;
         let source = open_datacite_source(input)?;
-        build_fst_index_from_source(source, "id", &fst_path, temp_dir)?;
+        build_fst_index_from_source(source, &fst_path, temp_dir)?;
         return Ok(Some(FstIndex::load(&fst_path)?));
     }
 
