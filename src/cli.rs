@@ -32,7 +32,7 @@ impl FromStr for OutputType {
 #[derive(Parser)]
 #[command(name = "crossref-citation-extraction")]
 #[command(about = "Extract, invert, and validate DOI references from Crossref data")]
-#[command(version = "2.0.0")]
+#[command(version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,

@@ -1,19 +1,19 @@
-use lazy_static::lazy_static;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::common::ArxivMatch;
 
-lazy_static! {
-    /// Combined pattern matching all arXiv reference formats in a single scan.
-    ///
-    /// Matches (in order of priority):
-    /// 1. DOI format: 10.48550/arXiv.YYMM.NNNNN (groups 1,2)
-    /// 2. URL format: arxiv.org/abs/... or arxiv.org/pdf/... (groups 3,4)
-    /// 3. Modern format: arXiv:YYMM.NNNNN (groups 5,6)
-    /// 4. Old format: arXiv:category/NNNNNNN (groups 7,8)
-    ///
-    /// Using a single alternation pattern reduces text scanning from 4 passes to 1.
-    pub static ref ARXIV_COMBINED_PATTERN: Regex = Regex::new(
+/// Combined pattern matching all arXiv reference formats in a single scan.
+///
+/// Matches (in order of priority):
+/// 1. DOI format: 10.48550/arXiv.YYMM.NNNNN (groups 1,2)
+/// 2. URL format: arxiv.org/abs/... or arxiv.org/pdf/... (groups 3,4)
+/// 3. Modern format: arXiv:YYMM.NNNNN (groups 5,6)
+/// 4. Old format: arXiv:category/NNNNNNN (groups 7,8)
+///
+/// Using a single alternation pattern reduces text scanning from 4 passes to 1.
+pub static ARXIV_COMBINED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
         r"(?ix)
         # DOI format: 10.48550/arXiv.YYMM.NNNNN
         (10\.48550/arxiv\.(\d{4}\.\d{4,6}(?:v\d+)?))
@@ -26,9 +26,10 @@ lazy_static! {
         |
         # Old format: arXiv:category/NNNNNNN (e.g., hep-ph/9901234, cs.DM/9910013)
         (arxiv[.:\s]+([a-z][a-z0-9.-]*/\s*\d{7}(?:v\d+)?))
-        "
-    ).unwrap();
-}
+        ",
+    )
+    .unwrap()
+});
 
 /// Normalize an arXiv ID by converting to lowercase, removing whitespace, and stripping version
 #[inline]

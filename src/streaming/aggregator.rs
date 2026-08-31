@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{info, warn};
 use polars::prelude::*;
 use rayon::prelude::*;
@@ -425,23 +425,33 @@ pub fn aggregate_and_validate(
     let mut valid_writer = outputs
         .valid
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode).expect("Failed to open valid output"));
+        .map(|p| open_output_writer(p, append_mode))
+        .transpose()
+        .context("Failed to open valid output")?;
     let mut failed_writer = outputs
         .failed
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode).expect("Failed to open failed output"));
+        .map(|p| open_output_writer(p, append_mode))
+        .transpose()
+        .context("Failed to open failed output")?;
     let mut publisher_writer = outputs
         .publisher
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode).expect("Failed to open publisher output"));
+        .map(|p| open_output_writer(p, append_mode))
+        .transpose()
+        .context("Failed to open publisher output")?;
     let mut crossref_writer = outputs
         .crossref
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode).expect("Failed to open crossref output"));
+        .map(|p| open_output_writer(p, append_mode))
+        .transpose()
+        .context("Failed to open crossref output")?;
     let mut mined_writer = outputs
         .mined
         .as_ref()
-        .map(|p| open_output_writer(p, append_mode).expect("Failed to open mined output"));
+        .map(|p| open_output_writer(p, append_mode))
+        .transpose()
+        .context("Failed to open mined output")?;
 
     // Clean up any stale temp files from interrupted runs
     cleanup_stale_temp_files(partition_dir)?;
