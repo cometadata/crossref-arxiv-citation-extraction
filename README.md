@@ -83,7 +83,7 @@ Re-run aggregation over existing partitions (skips the extraction phase). `--inp
 | `--temp-dir` | Directory for intermediate partition files (default: system temp). Without `--keep-intermediates` this directory itself is deleted after a successful run, so do not point it at a directory holding other files |
 | `--partitions-dir` | Use existing partitions (skip extraction phase); these partitions are always kept |
 | `--batch-size` | Batch size for memory management (default: 5000000) |
-| `--resume` | Resume extraction and aggregation from checkpoint files in the partition directory |
+| `--resume` | Resume extraction and aggregation from checkpoint files in the partition directory. Only for directories written by this version — see [Architecture](#architecture) |
 | `--checkpoint-interval` | Partitions between aggregation checkpoints (default: 1; 0 disables checkpointing) |
 | `--keep-intermediates` | Keep partition files after completion; without it the partition directory is deleted once the run succeeds |
 | `--log-level` | Logging level: DEBUG, INFO, WARN, ERROR |
@@ -101,12 +101,17 @@ Each line of the output is a JSON object representing a cited arXiv work:
 ```json
 {
   "doi": "10.48550/arXiv.2403.03542",
-  "citation_count": 3,
+  "citation_count": 2,
   "cited_by": [
     {
       "doi": "10.5678/citing-paper",
       "provenance": "publisher",
       "reference": {"DOI": "10.48550/arXiv.2403.03542", "doi-asserted-by": "publisher"}
+    },
+    {
+      "doi": "10.5678/another-citing-paper",
+      "provenance": "mined",
+      "reference": {"unstructured": "See arXiv:2403.03542 for details"}
     }
   ]
 }
@@ -143,6 +148,8 @@ The tool uses a streaming architecture to process large datasets with bounded me
 A read error in the input archive — a truncated or corrupt tar.gz, for example — aborts the run with an error rather than logging a warning and exiting successfully with partial output.
 
 Long-running pipelines can be resumed with `--resume` from checkpoint files stored in the partition directory.
+
+Partition directories and checkpoints written by earlier versions of this tool are not compatible with the current arXiv-ID partitioning scheme: do not `--resume` a run that was started with an older binary. Delete the partition directory and start the extraction fresh instead. Resuming a legacy partition directory is rejected with an error rather than silently producing duplicate, fragmented records.
 
 ## Development
 
