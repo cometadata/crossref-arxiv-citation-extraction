@@ -21,6 +21,7 @@ import time
 import random
 import argparse
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from typing import Optional
 from urllib.parse import quote
@@ -553,21 +554,18 @@ class CitationVerifier:
         except Exception as e:
             result.opencitations_error = str(e)
 
-    def verify(self, sample: CitationSample) -> VerificationResult:
-        """Verify a citation against all APIs."""
-        result = VerificationResult(
-            citing_doi=sample.citing_doi,
-            arxiv_id=sample.arxiv_id,
-            source=sample.source,
-            doi_asserted_by=sample.doi_asserted_by
-        )
 
-        self.verify_crossref(sample, result)
-        self.verify_openalex(sample, result)
-        self.verify_datacite(sample, result)
-        self.verify_opencitations(sample, result)
+def _run_api_pass(fn, samples, results, desc, position):
+    """Run one API's verification over all samples (one thread per API).
 
-        return result
+    Each thread writes disjoint attributes on shared VerificationResult
+    objects, so no locking is needed.
+    """
+    for sample, result in tqdm(
+        list(zip(samples, results)),
+        desc=desc, unit="citation", position=position, leave=False,
+    ):
+        fn(sample, result)
 
 
 def compute_summary(results: list[VerificationResult]) -> dict:
@@ -776,13 +774,29 @@ def main() -> int:
         skip_opencitations=args.skip_opencitations,
     )
 
-    results: list[VerificationResult] = []
+    results = [
+        VerificationResult(
+            citing_doi=s.citing_doi,
+            arxiv_id=s.arxiv_id,
+            source=s.source,
+            doi_asserted_by=s.doi_asserted_by,
+        )
+        for s in samples
+    ]
 
-    with tqdm(total=len(samples), desc="Verifying citations", unit="citation") as pbar:
-        for sample in samples:
-            result = verifier.verify(sample)
-            results.append(result)
-            pbar.update(1)
+    passes = [
+        (verifier.verify_crossref, "Crossref"),
+        (verifier.verify_openalex, "OpenAlex"),
+        (verifier.verify_datacite, "DataCite"),
+        (verifier.verify_opencitations, "OpenCitations"),
+    ]
+    with ThreadPoolExecutor(max_workers=len(passes)) as executor:
+        futures = [
+            executor.submit(_run_api_pass, fn, samples, results, desc, i)
+            for i, (fn, desc) in enumerate(passes)
+        ]
+        for future in futures:
+            future.result()  # re-raise any worker exception
 
     print(f"\nWriting results...")
 
