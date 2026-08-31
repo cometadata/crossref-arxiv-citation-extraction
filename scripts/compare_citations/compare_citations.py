@@ -248,7 +248,11 @@ class APIClient:
                 elif resp.status_code == 404:
                     return None
                 elif resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 2 ** (attempt + 1)))
+                    header = resp.headers.get("Retry-After")
+                    try:
+                        retry_after = int(header) if header else 2 ** (attempt + 1)
+                    except ValueError:  # HTTP-date form
+                        retry_after = 2 ** (attempt + 1)
                     time.sleep(retry_after)
                     continue
                 elif resp.status_code >= 500:
@@ -262,6 +266,9 @@ class APIClient:
                     continue
                 raise
             except requests.RequestException:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
                 return None
 
         return None
@@ -335,6 +342,9 @@ def _sample_from_config(
                 if j < target_size:
                     samples[j] = sample
 
+        # Intentional speed/randomness trade-off: stop after seeing 10x the
+        # target, so samples are drawn from the head of the (shuffled-on-
+        # publish) dataset rather than a full pass over every record.
         if seen >= target_size * 10:
             break
 
@@ -450,13 +460,11 @@ class CitationVerifier:
                     return
 
                 if unstructured:
-                    matches = self.ARXIV_PATTERN.findall(unstructured)
-                    for match in matches:
+                    for match in self.ARXIV_PATTERN.findall(unstructured):
                         if match.split("v")[0] == arxiv_id.split("v")[0]:
                             result.crossref_unstructured_match = True
                             result.crossref_reference_key = ref.get("key")
-                            if not result.crossref_structured_doi_match:
-                                return
+                            return
 
                 for field in ["article-title", "journal-title", "volume-title"]:
                     text = ref.get(field, "")
