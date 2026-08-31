@@ -1,6 +1,5 @@
 use anyhow::Result;
 use log::{info, warn};
-use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -20,6 +19,40 @@ const FLUSH_THRESHOLD_DIVISOR: usize = 100;
 
 /// Files processed between durable checkpoint commits during extraction.
 const CHECKPOINT_FILES_INTERVAL: usize = 25;
+
+/// Extraction reads only the work DOI, the reference array, and five fields per
+/// reference. Parsing whole files into `serde_json::Value` allocated a tree node
+/// for every other field too; these types read just what is used and leave each
+/// reference as an unparsed slice of the source buffer.
+#[derive(serde::Deserialize)]
+struct CrossrefFile<'a> {
+    #[serde(default, borrow)]
+    items: Vec<CrossrefItem<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CrossrefItem<'a> {
+    #[serde(rename = "DOI", default, borrow)]
+    doi: Option<std::borrow::Cow<'a, str>>,
+    #[serde(rename = "reference", default, borrow)]
+    references: Vec<&'a serde_json::value::RawValue>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RefFields<'a> {
+    #[serde(rename = "DOI", default, borrow)]
+    doi: Option<std::borrow::Cow<'a, str>>,
+    #[serde(rename = "URL", default, borrow)]
+    url: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    unstructured: Option<std::borrow::Cow<'a, str>>,
+    #[serde(rename = "article-title", default, borrow)]
+    article_title: Option<std::borrow::Cow<'a, str>>,
+    #[serde(rename = "journal-title", default, borrow)]
+    journal_title: Option<std::borrow::Cow<'a, str>>,
+    #[serde(rename = "doi-asserted-by", default, borrow)]
+    doi_asserted_by: Option<std::borrow::Cow<'a, str>>,
+}
 
 /// Make all buffered rows durable, then mark pending files complete.
 /// Order matters: a file checkpointed before its rows are flushed would be
@@ -44,12 +77,12 @@ fn commit_progress(
 
 /// Quick check if reference has any fields worth searching.
 #[inline]
-fn has_searchable_content(reference: &Value) -> bool {
-    reference.get("DOI").is_some()
-        || reference.get("unstructured").is_some()
-        || reference.get("URL").is_some()
-        || reference.get("article-title").is_some()
-        || reference.get("journal-title").is_some()
+fn has_searchable_content(reference: &RefFields<'_>) -> bool {
+    reference.doi.is_some()
+        || reference.unstructured.is_some()
+        || reference.url.is_some()
+        || reference.article_title.is_some()
+        || reference.journal_title.is_some()
 }
 
 #[inline]
@@ -57,31 +90,24 @@ fn quick_arxiv_likely(text: &str) -> bool {
     text.to_ascii_lowercase().contains("arxiv")
 }
 
-fn build_search_text(reference: &Value, buffer: &mut String) -> bool {
+fn build_search_text(reference: &RefFields<'_>, buffer: &mut String) -> bool {
     buffer.clear();
 
-    if let Some(doi) = reference.get("DOI").and_then(|v| v.as_str()) {
-        buffer.push_str(doi);
+    for v in [
+        &reference.doi,
+        &reference.url,
+        &reference.article_title,
+        &reference.journal_title,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        buffer.push_str(v);
         buffer.push(' ');
     }
 
-    if let Some(url) = reference.get("URL").and_then(|v| v.as_str()) {
-        buffer.push_str(url);
-        buffer.push(' ');
-    }
-
-    if let Some(title) = reference.get("article-title").and_then(|v| v.as_str()) {
-        buffer.push_str(title);
-        buffer.push(' ');
-    }
-
-    if let Some(journal) = reference.get("journal-title").and_then(|v| v.as_str()) {
-        buffer.push_str(journal);
-        buffer.push(' ');
-    }
-
-    if let Some(unstructured) = reference.get("unstructured").and_then(|v| v.as_str()) {
-        buffer.push_str(unstructured);
+    if let Some(v) = &reference.unstructured {
+        buffer.push_str(v);
     }
 
     !buffer.is_empty()
@@ -93,17 +119,14 @@ fn should_include_citation(citing_doi: &str, cited_id: &str) -> bool {
 }
 
 #[inline]
-fn determine_provenance(reference: &Value, extracted_doi: &str) -> Provenance {
-    if let Some(doi_field) = reference.get("DOI").and_then(|v| v.as_str()) {
+fn determine_provenance(reference: &RefFields<'_>, extracted_doi: &str) -> Provenance {
+    if let Some(doi_field) = &reference.doi {
         if doi_field.eq_ignore_ascii_case(extracted_doi) {
-            if let Some(asserted_by) = reference.get("doi-asserted-by").and_then(|v| v.as_str()) {
-                return match asserted_by {
-                    "publisher" => Provenance::Publisher,
-                    "crossref" => Provenance::Crossref,
-                    _ => Provenance::Mined,
-                };
-            }
-            return Provenance::Mined;
+            return match reference.doi_asserted_by.as_deref() {
+                Some("publisher") => Provenance::Publisher,
+                Some("crossref") => Provenance::Crossref,
+                _ => Provenance::Mined,
+            };
         }
     }
 
@@ -326,7 +349,7 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
             }
         }
 
-        let json: Value = match serde_json::from_slice(&entry.bytes) {
+        let parsed: CrossrefFile = match serde_json::from_slice(&entry.bytes) {
             Ok(v) => v,
             Err(e) => {
                 warn!("Failed to parse JSON in {}: {}", entry.filename, e);
@@ -334,76 +357,78 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
             }
         };
 
-        if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
-            for item in items {
-                items_processed += 1;
+        for item in &parsed.items {
+            items_processed += 1;
 
-                let work_doi = match item.get("DOI").and_then(|v| v.as_str()) {
-                    Some(doi) => doi.to_lowercase(),
-                    None => continue,
+            let work_doi = match &item.doi {
+                Some(doi) => doi.to_lowercase(),
+                None => continue,
+            };
+
+            for (ref_idx, raw_ref) in item.references.iter().enumerate() {
+                let ref_index = ref_idx as u32;
+
+                let reference: RefFields = match serde_json::from_str(raw_ref.get()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
                 };
 
-                if let Some(references) = item.get("reference").and_then(|v| v.as_array()) {
-                    for (ref_idx, reference) in references.iter().enumerate() {
-                        let ref_index = ref_idx as u32;
+                if !has_searchable_content(&reference) {
+                    continue;
+                }
 
-                        if !has_searchable_content(reference) {
-                            continue;
-                        }
+                if !build_search_text(&reference, &mut search_text) {
+                    continue;
+                }
 
-                        if !build_search_text(reference, &mut search_text) {
-                            continue;
-                        }
+                if !quick_arxiv_likely(&search_text) {
+                    continue;
+                }
 
-                        if !quick_arxiv_likely(&search_text) {
-                            continue;
-                        }
+                let matches = extract_arxiv_as_dois(&search_text);
 
-                        let matches = extract_arxiv_as_dois(&search_text);
+                if matches.is_empty() {
+                    refs_no_match += 1;
+                    continue;
+                }
 
-                        if matches.is_empty() {
-                            refs_no_match += 1;
-                            continue;
-                        }
+                let mut ref_json_cache: Option<String> = None;
 
-                        let mut ref_json_cache: Option<String> = None;
-
-                        for (doi, _raw) in matches {
-                            if !should_include_citation(&work_doi, &doi) {
-                                refs_filtered_self_cite += 1;
-                                continue;
-                            }
-
-                            let provenance = determine_provenance(reference, &doi);
-
-                            if !args.should_include_provenance(provenance.as_str()) {
-                                refs_filtered_provenance += 1;
-                                continue;
-                            }
-
-                            let ref_json =
-                                ref_json_cache.get_or_insert_with(|| reference.to_string());
-
-                            partition_writer.write(PartitionRow {
-                                citing_doi: work_doi.clone(),
-                                ref_index,
-                                cited_id: doi, // Move instead of clone - we own this
-                                provenance: provenance.as_str().to_string(),
-                                ref_json: ref_json.clone(),
-                            })?;
-                            refs_extracted += 1;
-                        }
+                for (doi, _raw) in matches {
+                    if !should_include_citation(&work_doi, &doi) {
+                        refs_filtered_self_cite += 1;
+                        continue;
                     }
-                }
 
-                if items_processed.is_multiple_of(100_000) {
-                    info!(
-                        "Progress: {} items, {} extracted, {} filtered (provenance: {}, self-cite: {})",
-                        items_processed, refs_extracted,
-                        refs_filtered_provenance + refs_filtered_self_cite,
-                        refs_filtered_provenance, refs_filtered_self_cite
-                    );
+                    let provenance = determine_provenance(&reference, &doi);
+
+                    if !args.should_include_provenance(provenance.as_str()) {
+                        refs_filtered_provenance += 1;
+                        continue;
+                    }
+
+                    let ref_json = ref_json_cache.get_or_insert_with(|| raw_ref.get().to_string());
+
+                    partition_writer.write(PartitionRow {
+                        citing_doi: work_doi.clone(),
+                        ref_index,
+                        cited_id: doi, // Move instead of clone - we own this
+                        provenance: provenance.as_str().to_string(),
+                        ref_json: ref_json.clone(),
+                    })?;
+                    refs_extracted += 1;
                 }
+            }
+
+            if items_processed.is_multiple_of(100_000) {
+                info!(
+                    "Progress: {} items, {} extracted, {} filtered (provenance: {}, self-cite: {})",
+                    items_processed,
+                    refs_extracted,
+                    refs_filtered_provenance + refs_filtered_self_cite,
+                    refs_filtered_provenance,
+                    refs_filtered_self_cite
+                );
             }
         }
 
@@ -508,34 +533,38 @@ mod tests {
         assert!(!should_include_citation("10.1234/A", "10.1234/a")); // Case insensitive
     }
 
+    fn ref_fields(json: &str) -> RefFields<'_> {
+        serde_json::from_str(json).unwrap()
+    }
+
     #[test]
     fn test_determine_provenance() {
         use crate::extract::Provenance;
-        use serde_json::json;
 
         // Publisher asserted
-        let ref_publisher = json!({"DOI": "10.1234/test", "doi-asserted-by": "publisher"});
+        let ref_publisher =
+            ref_fields(r#"{"DOI": "10.1234/test", "doi-asserted-by": "publisher"}"#);
         assert_eq!(
             determine_provenance(&ref_publisher, "10.1234/test"),
             Provenance::Publisher
         );
 
         // Crossref asserted
-        let ref_crossref = json!({"DOI": "10.1234/test", "doi-asserted-by": "crossref"});
+        let ref_crossref = ref_fields(r#"{"DOI": "10.1234/test", "doi-asserted-by": "crossref"}"#);
         assert_eq!(
             determine_provenance(&ref_crossref, "10.1234/test"),
             Provenance::Crossref
         );
 
         // DOI present but no doi-asserted-by
-        let ref_no_assertion = json!({"DOI": "10.1234/test"});
+        let ref_no_assertion = ref_fields(r#"{"DOI": "10.1234/test"}"#);
         assert_eq!(
             determine_provenance(&ref_no_assertion, "10.1234/test"),
             Provenance::Mined
         );
 
         // Mined from unstructured (DOI not in DOI field)
-        let ref_unstructured = json!({"unstructured": "See doi:10.1234/test"});
+        let ref_unstructured = ref_fields(r#"{"unstructured": "See doi:10.1234/test"}"#);
         assert_eq!(
             determine_provenance(&ref_unstructured, "10.1234/test"),
             Provenance::Mined
@@ -544,34 +573,38 @@ mod tests {
 
     #[test]
     fn test_has_searchable_content() {
-        use serde_json::json;
-
         // Has DOI field
-        assert!(has_searchable_content(&json!({"DOI": "10.1234/test"})));
+        assert!(has_searchable_content(&ref_fields(
+            r#"{"DOI": "10.1234/test"}"#
+        )));
 
         // Has unstructured field
-        assert!(has_searchable_content(
-            &json!({"unstructured": "Some text"})
-        ));
+        assert!(has_searchable_content(&ref_fields(
+            r#"{"unstructured": "Some text"}"#
+        )));
 
         // Has URL field
-        assert!(has_searchable_content(
-            &json!({"URL": "https://example.com"})
-        ));
+        assert!(has_searchable_content(&ref_fields(
+            r#"{"URL": "https://example.com"}"#
+        )));
 
         // Has article-title field
-        assert!(has_searchable_content(&json!({"article-title": "A Paper"})));
+        assert!(has_searchable_content(&ref_fields(
+            r#"{"article-title": "A Paper"}"#
+        )));
 
         // Has journal-title field
-        assert!(has_searchable_content(&json!({"journal-title": "Nature"})));
+        assert!(has_searchable_content(&ref_fields(
+            r#"{"journal-title": "Nature"}"#
+        )));
 
         // Empty reference
-        assert!(!has_searchable_content(&json!({})));
+        assert!(!has_searchable_content(&ref_fields(r#"{}"#)));
 
         // Only has irrelevant fields
-        assert!(!has_searchable_content(
-            &json!({"key": "ref1", "author": "Smith"})
-        ));
+        assert!(!has_searchable_content(&ref_fields(
+            r#"{"key": "r1", "author": "Smith"}"#
+        )));
     }
 
     #[test]
@@ -589,21 +622,21 @@ mod tests {
 
     #[test]
     fn test_build_search_text() {
-        use serde_json::json;
-
         let mut buffer = String::new();
 
         // Single field
-        let has_text = build_search_text(&json!({"DOI": "10.1234/test"}), &mut buffer);
+        let has_text = build_search_text(&ref_fields(r#"{"DOI": "10.1234/test"}"#), &mut buffer);
         assert!(has_text);
         assert!(buffer.contains("10.1234/test"));
 
         // Multiple fields
         let has_text = build_search_text(
-            &json!({
+            &ref_fields(
+                r#"{
                 "DOI": "10.1234/test",
                 "unstructured": "A paper about something"
-            }),
+            }"#,
+            ),
             &mut buffer,
         );
         assert!(has_text);
@@ -611,11 +644,14 @@ mod tests {
         assert!(buffer.contains("A paper about something"));
 
         // Empty reference
-        let has_text = build_search_text(&json!({}), &mut buffer);
+        let has_text = build_search_text(&ref_fields(r#"{}"#), &mut buffer);
         assert!(!has_text);
 
         // Only irrelevant fields
-        let has_text = build_search_text(&json!({"key": "ref1", "author": "Smith"}), &mut buffer);
+        let has_text = build_search_text(
+            &ref_fields(r#"{"key": "ref1", "author": "Smith"}"#),
+            &mut buffer,
+        );
         assert!(!has_text);
     }
 
