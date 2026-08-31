@@ -157,16 +157,24 @@ impl FlatDirectorySource {
     }
 
     fn open_next_file(&mut self) -> Option<()> {
-        let path = self.files.next()?;
-        let file = File::open(&path).ok()?;
+        loop {
+            let path = self.files.next()?;
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("Skipping unreadable input file {}: {}", path.display(), e);
+                    continue;
+                }
+            };
 
-        if path.to_string_lossy().ends_with(".gz") {
-            let decoder = GzDecoder::new(file);
-            self.current_reader = Some(LineReader::Compressed(BufReader::new(decoder).lines()));
-        } else {
-            self.current_reader = Some(LineReader::Uncompressed(BufReader::new(file).lines()));
+            if path.to_string_lossy().ends_with(".gz") {
+                let decoder = GzDecoder::new(file);
+                self.current_reader = Some(LineReader::Compressed(BufReader::new(decoder).lines()));
+            } else {
+                self.current_reader = Some(LineReader::Uncompressed(BufReader::new(file).lines()));
+            }
+            return Some(());
         }
-        Some(())
     }
 }
 
@@ -233,11 +241,20 @@ impl NestedSnapshotSource {
     }
 
     fn open_next_file(&mut self) -> Option<()> {
-        let path = self.files.next()?;
-        let file = File::open(&path).ok()?;
-        let decoder = GzDecoder::new(file);
-        self.current_reader = Some(BufReader::new(decoder).lines());
-        Some(())
+        loop {
+            let path = self.files.next()?;
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("Skipping unreadable input file {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+
+            let decoder = GzDecoder::new(file);
+            self.current_reader = Some(BufReader::new(decoder).lines());
+            return Some(());
+        }
     }
 }
 
@@ -345,6 +362,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_flat_directory_skips_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let flat_dir = dir.path().join("datacite");
+        std::fs::create_dir(&flat_dir).unwrap();
+
+        std::fs::write(flat_dir.join("a.jsonl"), r#"{"id": "10.1/a"}"#).unwrap();
+        let blocked = flat_dir.join("b.jsonl");
+        std::fs::write(&blocked, r#"{"id": "10.1/b"}"#).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(flat_dir.join("c.jsonl"), r#"{"id": "10.1/c"}"#).unwrap();
+
+        if File::open(&blocked).is_ok() {
+            eprintln!("skipping test: running with elevated privileges");
+            return;
+        }
+
+        let input = DataciteInput::FlatDirectory(flat_dir);
+        let source = open_datacite_source(input).unwrap();
+        let ids: Vec<String> = source
+            .map(|r| r.unwrap()["id"].as_str().unwrap().to_string())
+            .collect();
+
+        // b.jsonl is skipped with a warning; a and c still arrive.
+        assert_eq!(ids, vec!["10.1/a", "10.1/c"]);
+    }
+
+    #[test]
     fn test_nested_snapshot_source() {
         let dir = tempdir().unwrap();
         let snapshot_dir = dir.path().join("datacite");
@@ -367,5 +414,43 @@ mod tests {
         let records: Vec<_> = source.collect();
 
         assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_nested_snapshot_skips_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let snapshot_dir = dir.path().join("datacite");
+        let month_dir = snapshot_dir.join("updated_2024-01");
+        std::fs::create_dir_all(&month_dir).unwrap();
+
+        let write_gz = |path: &PathBuf, id: &str| {
+            let file = File::create(path).unwrap();
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut writer = std::io::BufWriter::new(encoder);
+            writeln!(writer, r#"{{"id": "{}"}}"#, id).unwrap();
+            writer.into_inner().unwrap().finish().unwrap();
+        };
+
+        write_gz(&month_dir.join("part_0000.jsonl.gz"), "10.1/a");
+        let blocked = month_dir.join("part_0001.jsonl.gz");
+        write_gz(&blocked, "10.1/b");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        write_gz(&month_dir.join("part_0002.jsonl.gz"), "10.1/c");
+
+        if File::open(&blocked).is_ok() {
+            eprintln!("skipping test: running with elevated privileges");
+            return;
+        }
+
+        let input = DataciteInput::NestedSnapshot(snapshot_dir);
+        let source = open_datacite_source(input).unwrap();
+        let ids: Vec<String> = source
+            .map(|r| r.unwrap()["id"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(ids, vec!["10.1/a", "10.1/c"]);
     }
 }
