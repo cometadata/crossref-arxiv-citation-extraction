@@ -18,6 +18,30 @@ use crate::streaming::{
 
 const FLUSH_THRESHOLD_DIVISOR: usize = 100;
 
+/// Files processed between durable checkpoint commits during extraction.
+const CHECKPOINT_FILES_INTERVAL: usize = 25;
+
+/// Make all buffered rows durable, then mark pending files complete.
+/// Order matters: a file checkpointed before its rows are flushed would be
+/// skipped on resume with those rows lost.
+fn commit_progress(
+    writer: &mut SegmentedPartitionWriter,
+    checkpoint: &mut Option<ExtractionCheckpoint>,
+    pending: &mut Vec<String>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    writer.flush_all()?;
+    if let Some(cp) = checkpoint {
+        for filename in pending.iter() {
+            cp.mark_completed(filename)?;
+        }
+    }
+    pending.clear();
+    Ok(())
+}
+
 /// Quick check if reference has any fields worth searching.
 #[inline]
 fn has_searchable_content(reference: &Value) -> bool {
@@ -261,6 +285,7 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
     let mut refs_filtered_provenance = 0u64;
     let mut refs_filtered_self_cite = 0u64;
     let mut refs_no_match = 0u64;
+    let mut pending_files: Vec<String> = Vec::new();
 
     let mut search_text = String::with_capacity(512);
 
@@ -357,13 +382,18 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
             }
         }
 
-        if let Some(ref mut cp) = checkpoint {
-            cp.mark_completed(&entry.filename)?;
-        }
+        pending_files.push(entry.filename);
         files_processed += 1;
+
+        // Periodic durable commit only matters when checkpointing; without
+        // --resume, segment flushing stays purely threshold-driven.
+        if checkpoint.is_some() && pending_files.len() >= CHECKPOINT_FILES_INTERVAL {
+            commit_progress(&mut partition_writer, &mut checkpoint, &mut pending_files)?;
+        }
     }
 
-    partition_writer.flush_all()?;
+    commit_progress(&mut partition_writer, &mut checkpoint, &mut pending_files)?;
+    partition_writer.flush_all()?; // no-op if commit_progress just ran; kept for the checkpoint-disabled path
 
     info!("Extraction complete:");
     info!("  Files processed: {}", files_processed);
@@ -609,5 +639,39 @@ mod tests {
         let text = "Just a regular DOI 10.1234/test";
         let results = extract_arxiv_as_dois(text);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_commit_progress_flushes_before_marking() {
+        use crate::streaming::{ExtractionCheckpoint, PartitionRow, SegmentedPartitionWriter};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let partition_dir = dir.path().join("partitions");
+        // Threshold high enough that nothing auto-flushes.
+        let mut writer = SegmentedPartitionWriter::new(&partition_dir, 1_000_000).unwrap();
+        writer
+            .write(PartitionRow {
+                citing_doi: "10.1111/a".to_string(),
+                ref_index: 0,
+                cited_id: "10.48550/arxiv.2403.00001".to_string(),
+                provenance: "mined".to_string(),
+                ref_json: "{}".to_string(),
+            })
+            .unwrap();
+        assert_eq!(writer.total_rows_written(), 0, "row is only buffered");
+
+        let cp_path = partition_dir.join("extraction.checkpoint");
+        let mut checkpoint = Some(ExtractionCheckpoint::new(&cp_path).unwrap());
+        let mut pending = vec!["file1.json".to_string()];
+
+        commit_progress(&mut writer, &mut checkpoint, &mut pending).unwrap();
+
+        assert_eq!(writer.total_rows_written(), 1, "buffered row hit disk");
+        assert!(pending.is_empty());
+        // Reload checkpoint from disk: the mark must be durable.
+        drop(checkpoint);
+        let reloaded = ExtractionCheckpoint::new(&cp_path).unwrap();
+        assert!(reloaded.is_completed("file1.json"));
     }
 }
