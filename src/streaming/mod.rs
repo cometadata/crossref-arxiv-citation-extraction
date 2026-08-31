@@ -1,5 +1,6 @@
 pub mod aggregator;
 pub mod checkpoint;
+pub mod kway_merge;
 pub mod segmented_writer;
 
 pub use aggregator::aggregate_and_validate;
