@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use log::info;
 use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use tar::Archive;
 
@@ -15,194 +16,82 @@ pub struct CrossrefEntry {
     pub bytes: Vec<u8>,
 }
 
-/// Trait for iterating over Crossref JSON files
-pub trait CrossrefSource: Iterator<Item = Result<CrossrefEntry>> {}
-
-/// Open a Crossref source based on detected input type
-pub fn open_crossref_source(input: CrossrefInput) -> Result<Box<dyn CrossrefSource>> {
+/// Visit every JSON entry in a Crossref input, in source order.
+/// The closure receives filename + raw bytes; parse failures are the
+/// caller's concern (it has the bytes), I/O failures abort the visit.
+pub fn visit_crossref_entries(
+    input: CrossrefInput,
+    mut f: impl FnMut(CrossrefEntry) -> Result<()>,
+) -> Result<()> {
     match input {
         CrossrefInput::TarGz(path) => {
             info!(
                 "Detected Crossref input: tar.gz archive at {}",
                 path.display()
             );
-            Ok(Box::new(TarGzSource::new(path)?))
-        }
-        CrossrefInput::Directory(path) => Ok(Box::new(DirectorySource::new(path)?)),
-        CrossrefInput::SingleJson(path) => Ok(Box::new(SingleJsonSource::new(path)?)),
-    }
-}
-
-/// Source that reads from a tar.gz archive
-pub struct TarGzSource {
-    archive: Archive<GzDecoder<File>>,
-    entries: Option<tar::Entries<'static, GzDecoder<File>>>,
-}
-
-impl TarGzSource {
-    pub fn new(path: PathBuf) -> Result<Self> {
-        let file =
-            File::open(&path).with_context(|| format!("Failed to open: {}", path.display()))?;
-        let gz = GzDecoder::new(file);
-        let archive = Archive::new(gz);
-
-        // We need to use unsafe to create a self-referential struct
-        // Alternative: just store the archive and create entries on iteration
-        Ok(Self {
-            archive,
-            entries: None,
-        })
-    }
-}
-
-impl Iterator for TarGzSource {
-    type Item = Result<CrossrefEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Initialize entries on first call
-        if self.entries.is_none() {
-            // Safety: we're creating a self-referential struct but the archive lives as long as entries
-            let archive_ptr = &mut self.archive as *mut Archive<GzDecoder<File>>;
-            let entries = unsafe { (*archive_ptr).entries() };
-            match entries {
-                Ok(e) => {
-                    // Transmute lifetime - this is safe because we own the archive
-                    self.entries = Some(unsafe {
-                        std::mem::transmute::<
-                            tar::Entries<'_, GzDecoder<File>>,
-                            tar::Entries<'static, GzDecoder<File>>,
-                        >(e)
-                    });
+            let file =
+                File::open(&path).with_context(|| format!("Failed to open: {}", path.display()))?;
+            let mut archive = Archive::new(GzDecoder::new(file));
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.to_path_buf();
+                let path_str = path.to_string_lossy();
+                if !path_str.ends_with(".json") {
+                    continue;
                 }
-                Err(e) => return Some(Err(e.into())),
+                let filename = path_str.to_string();
+                let mut bytes = Vec::with_capacity(entry.size() as usize);
+                entry.read_to_end(&mut bytes)?;
+                f(CrossrefEntry { filename, bytes })?;
             }
+            Ok(())
         }
-
-        let entries = self.entries.as_mut()?;
-
-        loop {
-            let entry = match entries.next()? {
-                Ok(e) => e,
-                Err(e) => return Some(Err(e.into())),
-            };
-
-            let path = match entry.path() {
-                Ok(p) => p.to_path_buf(),
-                Err(e) => return Some(Err(e.into())),
-            };
-
-            let path_str = path.to_string_lossy();
-            if !path_str.ends_with(".json") {
-                continue;
+        CrossrefInput::Directory(path) => {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&path)
+                .with_context(|| format!("Failed to read directory: {}", path.display()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+                .collect();
+            files.sort_by(|a, b| {
+                let num = |p: &PathBuf| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                };
+                match (num(a), num(b)) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    _ => a.cmp(b),
+                }
+            });
+            info!(
+                "Detected Crossref input: directory with {} JSON files",
+                files.len()
+            );
+            for path in files {
+                let filename = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let bytes = std::fs::read(&path)?;
+                f(CrossrefEntry { filename, bytes })?;
             }
-
-            let filename = path_str.to_string();
-            let mut entry = entry;
-            let mut bytes = Vec::with_capacity(entry.size() as usize);
-            use std::io::Read;
-            if let Err(e) = entry.read_to_end(&mut bytes) {
-                return Some(Err(e.into()));
-            }
-            return Some(Ok(CrossrefEntry { filename, bytes }));
+            Ok(())
         }
-    }
-}
-
-impl CrossrefSource for TarGzSource {}
-
-/// Source that reads from a directory of .json files
-pub struct DirectorySource {
-    files: std::vec::IntoIter<PathBuf>,
-}
-
-impl DirectorySource {
-    pub fn new(path: PathBuf) -> Result<Self> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&path)
-            .with_context(|| format!("Failed to read directory: {}", path.display()))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
-            .collect();
-
-        // Sort numerically by filename (0.json, 1.json, ..., 10.json)
-        files.sort_by(|a, b| {
-            let a_num = a
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok());
-            let b_num = b
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok());
-            match (a_num, b_num) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                _ => a.cmp(b),
-            }
-        });
-
-        info!(
-            "Detected Crossref input: directory with {} JSON files",
-            files.len()
-        );
-
-        Ok(Self {
-            files: files.into_iter(),
-        })
-    }
-}
-
-impl Iterator for DirectorySource {
-    type Item = Result<CrossrefEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let path = self.files.next()?;
-        let filename = path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        match std::fs::read(&path) {
-            Ok(bytes) => Some(Ok(CrossrefEntry { filename, bytes })),
-            Err(e) => Some(Err(e.into())),
+        CrossrefInput::SingleJson(path) => {
+            info!(
+                "Detected Crossref input: single JSON file at {}",
+                path.display()
+            );
+            let filename = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let bytes = std::fs::read(&path)?;
+            f(CrossrefEntry { filename, bytes })
         }
     }
 }
-
-impl CrossrefSource for DirectorySource {}
-
-/// Source that reads a single .json file
-pub struct SingleJsonSource {
-    path: Option<PathBuf>,
-}
-
-impl SingleJsonSource {
-    pub fn new(path: PathBuf) -> Result<Self> {
-        info!(
-            "Detected Crossref input: single JSON file at {}",
-            path.display()
-        );
-        Ok(Self { path: Some(path) })
-    }
-}
-
-impl Iterator for SingleJsonSource {
-    type Item = Result<CrossrefEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let path = self.path.take()?;
-        let filename = path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        match std::fs::read(&path) {
-            Ok(bytes) => Some(Ok(CrossrefEntry { filename, bytes })),
-            Err(e) => Some(Err(e.into())),
-        }
-    }
-}
-
-impl CrossrefSource for SingleJsonSource {}
 
 #[cfg(test)]
 mod tests {
@@ -232,17 +121,26 @@ mod tests {
         tar_path
     }
 
+    fn collect_entries(input: CrossrefInput) -> Vec<CrossrefEntry> {
+        let mut entries = Vec::new();
+        visit_crossref_entries(input, |entry| {
+            entries.push(entry);
+            Ok(())
+        })
+        .unwrap();
+        entries
+    }
+
     #[test]
     fn test_tar_gz_source() {
         let dir = tempdir().unwrap();
         let tar_path = create_test_tar_gz(dir.path());
 
-        let input = CrossrefInput::TarGz(tar_path);
-        let mut source = open_crossref_source(input).unwrap();
+        let entries = collect_entries(CrossrefInput::TarGz(tar_path));
 
-        let entry = source.next().unwrap().unwrap();
-        assert_eq!(entry.filename, "0.json");
-        let v: serde_json::Value = serde_json::from_slice(&entry.bytes).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].filename, "0.json");
+        let v: serde_json::Value = serde_json::from_slice(&entries[0].bytes).unwrap();
         assert!(v.get("items").is_some());
     }
 
@@ -263,16 +161,13 @@ mod tests {
         )
         .unwrap();
 
-        let input = CrossrefInput::Directory(json_dir);
-        let source = open_crossref_source(input).unwrap();
-        let entries: Vec<_> = source.collect();
+        let entries = collect_entries(CrossrefInput::Directory(json_dir));
 
         assert_eq!(entries.len(), 2);
         // Should be sorted by filename
-        assert_eq!(entries[0].as_ref().unwrap().filename, "0.json");
-        assert_eq!(entries[1].as_ref().unwrap().filename, "1.json");
-        let v: serde_json::Value =
-            serde_json::from_slice(&entries[0].as_ref().unwrap().bytes).unwrap();
+        assert_eq!(entries[0].filename, "0.json");
+        assert_eq!(entries[1].filename, "1.json");
+        let v: serde_json::Value = serde_json::from_slice(&entries[0].bytes).unwrap();
         assert!(v.get("items").is_some());
     }
 
@@ -282,13 +177,12 @@ mod tests {
         let json_path = dir.path().join("test.json");
         std::fs::write(&json_path, r#"{"items": [{"DOI": "10.1234/single"}]}"#).unwrap();
 
-        let input = CrossrefInput::SingleJson(json_path);
-        let mut source = open_crossref_source(input).unwrap();
+        let entries = collect_entries(CrossrefInput::SingleJson(json_path));
 
-        let entry = source.next().unwrap().unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&entry.bytes).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].filename, "test.json");
+        let v: serde_json::Value = serde_json::from_slice(&entries[0].bytes).unwrap();
         assert!(v.get("items").is_some());
-        assert!(source.next().is_none());
     }
 
     #[test]
@@ -306,11 +200,32 @@ mod tests {
             .unwrap();
         }
 
-        let input = CrossrefInput::Directory(json_dir);
-        let source = open_crossref_source(input).unwrap();
-        let filenames: Vec<_> = source.map(|e| e.unwrap().filename).collect();
+        let filenames: Vec<String> = collect_entries(CrossrefInput::Directory(json_dir))
+            .into_iter()
+            .map(|e| e.filename)
+            .collect();
 
         // Should be numerically sorted: 1, 2, 10
         assert_eq!(filenames, vec!["1.json", "2.json", "10.json"]);
+    }
+
+    #[test]
+    fn test_visitor_error_aborts_visit() {
+        let dir = tempdir().unwrap();
+        let json_dir = dir.path().join("crossref");
+        std::fs::create_dir(&json_dir).unwrap();
+        for i in [0, 1, 2] {
+            std::fs::write(json_dir.join(format!("{}.json", i)), "{}").unwrap();
+        }
+
+        let mut seen = 0usize;
+        let err = visit_crossref_entries(CrossrefInput::Directory(json_dir), |_entry| {
+            seen += 1;
+            Err(anyhow::anyhow!("consumer hung up"))
+        })
+        .unwrap_err();
+
+        assert_eq!(seen, 1, "visit stops at the first closure error");
+        assert!(err.to_string().contains("consumer hung up"));
     }
 }

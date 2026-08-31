@@ -4,12 +4,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use crate::cli::PipelineArgs;
+use crate::cli::{should_include_provenance_filter, PipelineArgs};
 use crate::common::{extract_input_stem, setup_logging, OutputPaths};
 use crate::extract::{extract_arxiv_matches_from_text, Provenance};
 use crate::index::{build_fst_index_from_source, FstIndex};
 use crate::input::{
-    detect_crossref_input, detect_datacite_input, open_crossref_source, open_datacite_source,
+    detect_crossref_input, detect_datacite_input, open_datacite_source, visit_crossref_entries,
+    CrossrefEntry,
 };
 use crate::streaming::{
     aggregate_and_validate, ExtractionCheckpoint, PartitionRow, SegmentedPartitionWriter,
@@ -19,6 +20,12 @@ const FLUSH_THRESHOLD_DIVISOR: usize = 100;
 
 /// Files processed between durable checkpoint commits during extraction.
 const CHECKPOINT_FILES_INTERVAL: usize = 25;
+
+/// Raw entries buffered between reader and parse workers.
+const ENTRY_CHANNEL_CAP: usize = 4;
+
+/// Per-file result batches buffered between workers and the writer.
+const RESULT_CHANNEL_CAP: usize = 32;
 
 /// Extraction reads only the work DOI, the reference array, and five fields per
 /// reference. Parsing whole files into `serde_json::Value` allocated a tree node
@@ -296,12 +303,127 @@ fn load_or_build_arxiv_fst(args: &PipelineArgs, temp_dir: &Path) -> Result<Optio
     Ok(None)
 }
 
+/// Per-file counters produced by a parse worker, folded into the run totals by
+/// the writer thread.
+#[derive(Default)]
+struct FileStats {
+    items: u64,
+    extracted: u64,
+    filtered_provenance: u64,
+    filtered_self_cite: u64,
+    no_match: u64,
+    refs_unparseable: u64,
+}
+
+/// Everything one input file produced: rows to write (in file order), counters,
+/// and whether the file failed to parse (a failed file is never checkpointed, so
+/// `--resume` retries it).
+struct FileResult {
+    filename: String,
+    rows: Vec<PartitionRow>,
+    stats: FileStats,
+    parse_failed: bool,
+}
+
+/// Parse one Crossref file and extract every arXiv citation it contains.
+/// Pure apart from the reusable `search_text` scratch buffer, so parse workers
+/// can run it concurrently.
+fn extract_file(
+    entry: &CrossrefEntry,
+    provenance_filter: &[String],
+    search_text: &mut String,
+) -> FileResult {
+    let mut result = FileResult {
+        filename: entry.filename.clone(),
+        rows: Vec::new(),
+        stats: FileStats::default(),
+        parse_failed: false,
+    };
+
+    let parsed: CrossrefFile = match serde_json::from_slice(&entry.bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to parse JSON in {}: {}", entry.filename, e);
+            result.parse_failed = true;
+            return result;
+        }
+    };
+
+    for item in &parsed.items {
+        result.stats.items += 1;
+
+        let work_doi = match &item.doi {
+            Some(doi) => doi.to_lowercase(),
+            None => continue,
+        };
+
+        for (ref_idx, raw_ref) in item.references.iter().enumerate() {
+            let ref_index = ref_idx as u32;
+
+            let reference: RefFields = match serde_json::from_str(raw_ref.get()) {
+                Ok(r) => r,
+                Err(_) => {
+                    result.stats.refs_unparseable += 1;
+                    continue;
+                }
+            };
+
+            if !has_searchable_content(&reference) {
+                continue;
+            }
+
+            if !build_search_text(&reference, search_text) {
+                continue;
+            }
+
+            if !quick_arxiv_likely(search_text) {
+                continue;
+            }
+
+            let matches = extract_arxiv_as_dois(search_text);
+
+            if matches.is_empty() {
+                result.stats.no_match += 1;
+                continue;
+            }
+
+            let mut ref_json_cache: Option<String> = None;
+
+            for (doi, _raw) in matches {
+                if !should_include_citation(&work_doi, &doi) {
+                    result.stats.filtered_self_cite += 1;
+                    continue;
+                }
+
+                let provenance = determine_provenance(&reference, &doi);
+
+                if !should_include_provenance_filter(provenance_filter, provenance.as_str()) {
+                    result.stats.filtered_provenance += 1;
+                    continue;
+                }
+
+                let ref_json = ref_json_cache.get_or_insert_with(|| raw_ref.get().to_string());
+
+                result.rows.push(PartitionRow {
+                    citing_doi: work_doi.clone(),
+                    ref_index,
+                    cited_id: doi, // Move instead of clone - we own this
+                    provenance: provenance.as_str().to_string(),
+                    ref_json: ref_json.clone(),
+                });
+                result.stats.extracted += 1;
+            }
+        }
+    }
+
+    result
+}
+
 fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<()> {
     let flush_threshold = (args.batch_size / FLUSH_THRESHOLD_DIVISOR).max(10000);
     let mut partition_writer = SegmentedPartitionWriter::new(partition_dir, flush_threshold)?;
 
     let input = detect_crossref_input(&args.input)?;
-    let source = open_crossref_source(input)?;
 
     let checkpoint_path = partition_dir.join("extraction.checkpoint");
     let mut checkpoint = if args.resume {
@@ -320,6 +442,13 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
         None
     };
 
+    // The reader thread needs its own copy of the completed set: the checkpoint
+    // itself stays with the writer, which is the only thread that mutates it.
+    let completed: std::collections::HashSet<String> = checkpoint
+        .as_ref()
+        .map(|cp| cp.completed_snapshot())
+        .unwrap_or_default();
+
     let mut items_processed = 0u64;
     let mut files_processed = 0u64;
     let mut files_skipped = 0u64;
@@ -327,120 +456,98 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
     let mut refs_filtered_provenance = 0u64;
     let mut refs_filtered_self_cite = 0u64;
     let mut refs_no_match = 0u64;
+    let mut refs_unparseable = 0u64;
     let mut pending_files: Vec<String> = Vec::new();
 
-    let mut search_text = String::with_capacity(512);
+    // One reader (gzip + tar), n parse/extract workers, and this thread as the
+    // writer: only the writer touches the partition writer and the checkpoint.
+    let n_workers = num_cpus::get().saturating_sub(2).max(1);
+    let (entry_tx, entry_rx) = crossbeam_channel::bounded::<CrossrefEntry>(ENTRY_CHANNEL_CAP);
+    let (result_tx, result_rx) = crossbeam_channel::bounded::<FileResult>(RESULT_CHANNEL_CAP);
 
-    info!("Extracting arXiv IDs from references...");
+    let provenance_filter = args.provenance.clone();
 
-    for entry_result in source {
-        let entry = match entry_result {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("Failed to read entry: {}", e);
-                continue;
-            }
-        };
+    info!(
+        "Extracting arXiv IDs from references ({} parse workers)...",
+        n_workers
+    );
 
-        if let Some(ref cp) = checkpoint {
-            if cp.is_completed(&entry.filename) {
-                files_skipped += 1;
-                continue;
-            }
+    std::thread::scope(|s| -> Result<()> {
+        // Reader: owns the archive; sends raw entries, skipping checkpointed files.
+        let reader = s.spawn(move || -> Result<u64> {
+            let mut skipped = 0u64;
+            visit_crossref_entries(input, |entry| {
+                if completed.contains(&entry.filename) {
+                    skipped += 1;
+                    return Ok(());
+                }
+                entry_tx
+                    .send(entry)
+                    .map_err(|_| anyhow::anyhow!("extraction workers hung up"))
+            })?;
+            Ok(skipped)
+        });
+
+        // Workers: parse + extract, one FileResult per file.
+        let mut worker_handles = Vec::new();
+        for _ in 0..n_workers {
+            let entry_rx = entry_rx.clone();
+            let result_tx = result_tx.clone();
+            let provenance_filter = provenance_filter.clone();
+            worker_handles.push(s.spawn(move || {
+                let mut search_text = String::with_capacity(512);
+                for entry in entry_rx.iter() {
+                    let result = extract_file(&entry, &provenance_filter, &mut search_text);
+                    if result_tx.send(result).is_err() {
+                        break; // writer gone; scope will surface its error
+                    }
+                }
+            }));
         }
+        drop(entry_rx);
+        drop(result_tx); // writer's rx closes when all workers finish
 
-        let parsed: CrossrefFile = match serde_json::from_slice(&entry.bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Failed to parse JSON in {}: {}", entry.filename, e);
-                continue;
+        // Writer: this thread. Single owner of partition_writer + checkpoint.
+        // Consumed by value so an early `?` drops the receiver and lets the
+        // workers unblock instead of deadlocking the scope's join.
+        for file_result in result_rx {
+            for row in file_result.rows {
+                partition_writer.write(row)?;
             }
-        };
+            items_processed += file_result.stats.items;
+            refs_extracted += file_result.stats.extracted;
+            refs_filtered_provenance += file_result.stats.filtered_provenance;
+            refs_filtered_self_cite += file_result.stats.filtered_self_cite;
+            refs_no_match += file_result.stats.no_match;
+            refs_unparseable += file_result.stats.refs_unparseable;
 
-        for item in &parsed.items {
-            items_processed += 1;
-
-            let work_doi = match &item.doi {
-                Some(doi) => doi.to_lowercase(),
-                None => continue,
-            };
-
-            for (ref_idx, raw_ref) in item.references.iter().enumerate() {
-                let ref_index = ref_idx as u32;
-
-                let reference: RefFields = match serde_json::from_str(raw_ref.get()) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-
-                if !has_searchable_content(&reference) {
-                    continue;
-                }
-
-                if !build_search_text(&reference, &mut search_text) {
-                    continue;
-                }
-
-                if !quick_arxiv_likely(&search_text) {
-                    continue;
-                }
-
-                let matches = extract_arxiv_as_dois(&search_text);
-
-                if matches.is_empty() {
-                    refs_no_match += 1;
-                    continue;
-                }
-
-                let mut ref_json_cache: Option<String> = None;
-
-                for (doi, _raw) in matches {
-                    if !should_include_citation(&work_doi, &doi) {
-                        refs_filtered_self_cite += 1;
-                        continue;
-                    }
-
-                    let provenance = determine_provenance(&reference, &doi);
-
-                    if !args.should_include_provenance(provenance.as_str()) {
-                        refs_filtered_provenance += 1;
-                        continue;
-                    }
-
-                    let ref_json = ref_json_cache.get_or_insert_with(|| raw_ref.get().to_string());
-
-                    partition_writer.write(PartitionRow {
-                        citing_doi: work_doi.clone(),
-                        ref_index,
-                        cited_id: doi, // Move instead of clone - we own this
-                        provenance: provenance.as_str().to_string(),
-                        ref_json: ref_json.clone(),
-                    })?;
-                    refs_extracted += 1;
-                }
+            if !file_result.parse_failed {
+                pending_files.push(file_result.filename);
+                files_processed += 1;
             }
 
-            if items_processed.is_multiple_of(100_000) {
+            // Periodic durable commit only matters when checkpointing; without
+            // --resume, segment flushing stays purely threshold-driven.
+            if checkpoint.is_some() && pending_files.len() >= CHECKPOINT_FILES_INTERVAL {
+                commit_progress(&mut partition_writer, &mut checkpoint, &mut pending_files)?;
+            }
+            if files_processed.is_multiple_of(100) {
                 info!(
-                    "Progress: {} items, {} extracted, {} filtered (provenance: {}, self-cite: {})",
-                    items_processed,
-                    refs_extracted,
-                    refs_filtered_provenance + refs_filtered_self_cite,
-                    refs_filtered_provenance,
-                    refs_filtered_self_cite
+                    "Progress: {} files, {} items, {} refs extracted",
+                    files_processed, items_processed, refs_extracted
                 );
             }
         }
 
-        pending_files.push(entry.filename);
-        files_processed += 1;
-
-        // Periodic durable commit only matters when checkpointing; without
-        // --resume, segment flushing stays purely threshold-driven.
-        if checkpoint.is_some() && pending_files.len() >= CHECKPOINT_FILES_INTERVAL {
-            commit_progress(&mut partition_writer, &mut checkpoint, &mut pending_files)?;
+        files_skipped = reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("reader thread panicked"))??;
+        for h in worker_handles {
+            h.join()
+                .map_err(|_| anyhow::anyhow!("worker thread panicked"))?;
         }
-    }
+        Ok(())
+    })?;
 
     commit_progress(&mut partition_writer, &mut checkpoint, &mut pending_files)?;
     partition_writer.flush_all()?; // no-op if commit_progress just ran; kept for the checkpoint-disabled path
@@ -461,6 +568,7 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
         refs_filtered_self_cite
     );
     info!("  Refs with no arXiv match: {}", refs_no_match);
+    info!("  Refs unparseable: {}", refs_unparseable);
 
     if let Some(cp) = checkpoint {
         cp.cleanup()?;
@@ -700,6 +808,80 @@ mod tests {
         let text = "Just a regular DOI 10.1234/test";
         let results = extract_arxiv_as_dois(text);
         assert!(results.is_empty());
+    }
+
+    fn entry(json: &str) -> CrossrefEntry {
+        CrossrefEntry {
+            filename: "0.json".to_string(),
+            bytes: json.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_extract_file_rows_and_stats() {
+        let e = entry(
+            r#"{"items": [
+                {"DOI": "10.1111/Citing", "reference": [
+                    {"unstructured": "See arXiv:2403.12345 for details"},
+                    "not an object",
+                    {"unstructured": "arXiv preprint without an identifier"},
+                    {"DOI": "10.48550/arXiv.2403.67890", "doi-asserted-by": "publisher"}
+                ]},
+                {"reference": [{"unstructured": "arXiv:2403.11111"}]}
+            ]}"#,
+        );
+        let mut buf = String::new();
+        let result = extract_file(&e, &[], &mut buf);
+
+        assert!(!result.parse_failed);
+        assert_eq!(result.filename, "0.json");
+        assert_eq!(result.stats.items, 2);
+        assert_eq!(result.stats.extracted, 2);
+        assert_eq!(
+            result.stats.refs_unparseable, 1,
+            "the bare string reference"
+        );
+        assert_eq!(result.stats.no_match, 1);
+        assert_eq!(result.stats.filtered_provenance, 0);
+        assert_eq!(result.stats.filtered_self_cite, 0);
+
+        // Rows stay in file order, and the DOI-less item contributes none.
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].citing_doi, "10.1111/citing");
+        assert_eq!(result.rows[0].ref_index, 0);
+        assert_eq!(result.rows[0].cited_id, "10.48550/arXiv.2403.12345");
+        assert_eq!(result.rows[0].provenance, "mined");
+        assert_eq!(result.rows[1].ref_index, 3);
+        assert_eq!(result.rows[1].cited_id, "10.48550/arXiv.2403.67890");
+        assert_eq!(result.rows[1].provenance, "publisher");
+    }
+
+    #[test]
+    fn test_extract_file_filters_self_cites_and_provenance() {
+        let e = entry(
+            r#"{"items": [{"DOI": "10.48550/arXiv.2403.99999", "reference": [
+                {"unstructured": "See arXiv:2403.99999"},
+                {"DOI": "10.48550/arXiv.2403.67890", "doi-asserted-by": "crossref"}
+            ]}]}"#,
+        );
+        let mut buf = String::new();
+        let filter = vec!["publisher".to_string()];
+        let result = extract_file(&e, &filter, &mut buf);
+
+        assert_eq!(result.stats.filtered_self_cite, 1);
+        assert_eq!(result.stats.filtered_provenance, 1);
+        assert_eq!(result.stats.extracted, 0);
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn test_extract_file_marks_parse_failure() {
+        let mut buf = String::new();
+        let result = extract_file(&entry("{not json"), &[], &mut buf);
+
+        assert!(result.parse_failed);
+        assert!(result.rows.is_empty());
+        assert_eq!(result.stats.items, 0);
     }
 
     #[test]

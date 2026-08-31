@@ -51,6 +51,7 @@ impl ExtractionCheckpoint {
     }
 
     /// Check if a filename has already been processed.
+    #[allow(dead_code)] // extraction filters against `completed_snapshot` instead
     #[inline]
     pub fn is_completed(&self, filename: &str) -> bool {
         self.completed.contains(filename)
@@ -68,6 +69,11 @@ impl ExtractionCheckpoint {
     /// Get count of completed files.
     pub fn completed_count(&self) -> usize {
         self.completed.len()
+    }
+
+    /// Clone the completed set (for sharing with a reader thread).
+    pub fn completed_snapshot(&self) -> HashSet<String> {
+        self.completed.clone()
     }
 
     /// Delete the checkpoint file (called on successful completion).

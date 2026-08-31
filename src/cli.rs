@@ -143,14 +143,18 @@ impl PipelineArgs {
     }
 
     /// Check if a provenance should be included based on the filter
+    #[allow(dead_code)] // extraction workers call the free function below
     pub fn should_include_provenance(&self, provenance: &str) -> bool {
-        if self.provenance.is_empty() {
-            return true;
-        }
-        self.provenance
-            .iter()
-            .any(|p| p.to_lowercase() == provenance.to_lowercase())
+        should_include_provenance_filter(&self.provenance, provenance)
     }
+}
+
+/// Check if a provenance passes the (possibly empty) filter list.
+///
+/// Free-function twin of [`PipelineArgs::should_include_provenance`], usable
+/// from worker threads that hold only a cloned filter list, not the args.
+pub fn should_include_provenance_filter(filter: &[String], provenance: &str) -> bool {
+    filter.is_empty() || filter.iter().any(|p| p.eq_ignore_ascii_case(provenance))
 }
 
 #[cfg(test)]
