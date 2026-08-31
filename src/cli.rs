@@ -122,45 +122,22 @@ pub struct PipelineArgs {
 }
 
 impl PipelineArgs {
-    /// Parse outputs into a HashSet.
-    /// Supports "all" alias for all output types.
+    /// Parse outputs into a HashSet. Supports the "all" alias; empty means all.
     pub fn parse_outputs(&self) -> Result<HashSet<OutputType>, String> {
-        if self.outputs.is_empty() || self.outputs.iter().any(|s| s.to_lowercase() == "all") {
-            let mut all = HashSet::new();
-            all.insert(OutputType::Valid);
-            all.insert(OutputType::Failed);
-            all.insert(OutputType::Publisher);
-            all.insert(OutputType::Crossref);
-            all.insert(OutputType::Mined);
-            return Ok(all);
+        let all = [
+            OutputType::Valid,
+            OutputType::Failed,
+            OutputType::Publisher,
+            OutputType::Crossref,
+            OutputType::Mined,
+        ];
+        if self.outputs.is_empty() || self.outputs.iter().any(|s| s.eq_ignore_ascii_case("all")) {
+            return Ok(all.into_iter().collect());
         }
-
-        let mut outputs = HashSet::new();
-        outputs.insert(OutputType::Valid);
-        outputs.insert(OutputType::Failed);
-
-        if self.provenance.is_empty() {
-            outputs.insert(OutputType::Publisher);
-            outputs.insert(OutputType::Crossref);
-            outputs.insert(OutputType::Mined);
-        } else {
-            for prov in &self.provenance {
-                match prov.to_lowercase().as_str() {
-                    "publisher" => {
-                        outputs.insert(OutputType::Publisher);
-                    }
-                    "crossref" => {
-                        outputs.insert(OutputType::Crossref);
-                    }
-                    "mined" => {
-                        outputs.insert(OutputType::Mined);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Ok(outputs)
+        self.outputs
+            .iter()
+            .map(|s| s.parse::<OutputType>())
+            .collect()
     }
 
     /// Check if a provenance should be included based on the filter
@@ -200,14 +177,13 @@ mod tests {
         assert_eq!("Valid".parse::<OutputType>().unwrap(), OutputType::Valid);
     }
 
-    #[test]
-    fn test_outputs_all_alias() {
-        let args = PipelineArgs {
+    fn args_with_outputs(outputs: Vec<&str>) -> PipelineArgs {
+        PipelineArgs {
             input: "test.tar.gz".to_string(),
             arxiv_records: None,
             arxiv_fst: None,
             provenance: vec![],
-            outputs: vec!["all".to_string()],
+            outputs: outputs.into_iter().map(String::from).collect(),
             output_dir: None,
             partitions_dir: None,
             log_level: "INFO".to_string(),
@@ -216,12 +192,38 @@ mod tests {
             batch_size: 5000000,
             resume: false,
             checkpoint_interval: 50,
-        };
-        let outputs = args.parse_outputs().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_outputs_all_alias() {
+        let outputs = args_with_outputs(vec!["all"]).parse_outputs().unwrap();
         assert!(outputs.contains(&OutputType::Valid));
         assert!(outputs.contains(&OutputType::Failed));
         assert!(outputs.contains(&OutputType::Publisher));
         assert!(outputs.contains(&OutputType::Crossref));
         assert!(outputs.contains(&OutputType::Mined));
+    }
+
+    #[test]
+    fn test_outputs_specific_selection_is_honored() {
+        let outputs = args_with_outputs(vec!["valid"]).parse_outputs().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs.contains(&OutputType::Valid));
+
+        let outputs = args_with_outputs(vec!["valid", "mined"])
+            .parse_outputs()
+            .unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.contains(&OutputType::Valid));
+        assert!(outputs.contains(&OutputType::Mined));
+    }
+
+    #[test]
+    fn test_outputs_invalid_value_errors() {
+        let err = args_with_outputs(vec!["valid", "bogus"])
+            .parse_outputs()
+            .unwrap_err();
+        assert!(err.contains("bogus"));
     }
 }
