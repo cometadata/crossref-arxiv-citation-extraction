@@ -8,6 +8,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::AggregationCheckpoint;
+use super::kway_merge::{merge_sorted_segments, MergeRow};
 use crate::index::FstIndex;
 
 /// Maximum number of segments to process at once in memory.
@@ -19,33 +20,24 @@ const SEGMENT_BATCH_THRESHOLD: usize = 100;
 const STREAM_CHUNK_SIZE: usize = 500_000;
 const _: () = assert!(STREAM_CHUNK_SIZE <= u32::MAX as usize, "STREAM_CHUNK_SIZE must fit in u32");
 
-/// Maximum files to keep before forcing streaming merge (used with STREAMING_ROW_THRESHOLD).
-const MAX_STREAMING_FILES: usize = 4;
-
-/// Row count threshold for switching to streaming merge when file count is low.
-const STREAMING_ROW_THRESHOLD: usize = 100_000_000;
+/// Total rows buffered across all merge cursors (bounds merge memory).
+const MERGE_BUFFER_ROWS: usize = 4_000_000;
 
 /// Progress logging interval (rows processed).
 const PROGRESS_LOG_INTERVAL: u64 = 5_000_000;
 
-/// Sort all segments in a partition to temp files, sorted by cited_id.
-/// Uses external merge sort: sort each segment individually, then merge in rounds.
-/// All temp files are written to the partition directory (not system temp).
-/// Returns a Vec of sorted files (may be multiple for very large partitions).
-fn sort_partition_to_temp(segments: &[PathBuf], partition_path: &Path) -> Result<Vec<PathBuf>> {
+/// Sort each segment of a partition to its own temp file, in parallel.
+/// Returns one sorted file per input segment; global ordering is produced
+/// later by the k-way merge, not here.
+fn sort_segments_to_temp(segments: &[PathBuf], partition_path: &Path) -> Result<Vec<PathBuf>> {
     // Set Polars temp directory to our partition path (with enough space).
-    // WARNING: This sets a global environment variable. Do NOT parallelize partition
-    // processing without first refactoring this to use a different approach (e.g.,
-    // setting once at startup or using Polars config API if available).
-    // SAFETY: This is safe because partitions are processed sequentially.
+    // SAFETY: partitions are processed sequentially; do not parallelize
+    // partition processing while this global env var is set per-partition.
     std::env::set_var("POLARS_TEMP_DIR", partition_path);
 
-    info!(
-        "Phase 1: Sorting {} segments in parallel...",
-        segments.len()
-    );
+    info!("Sorting {} segments in parallel...", segments.len());
 
-    let sorted_segments: Result<Vec<PathBuf>> = segments
+    segments
         .par_iter()
         .enumerate()
         .map(|(i, seg)| {
@@ -53,25 +45,11 @@ fn sort_partition_to_temp(segments: &[PathBuf], partition_path: &Path) -> Result
             sort_single_segment(seg, &sorted_seg_path)?;
             Ok(sorted_seg_path)
         })
-        .collect();
-    let sorted_segments = sorted_segments?;
-
-    info!(
-        "Phase 2: Merging {} sorted segments in rounds...",
-        sorted_segments.len()
-    );
-
-    let merged_files = merge_sorted_segments_rounds(sorted_segments, partition_path)?;
-
-    info!(
-        "  Merge complete: {} sorted file(s) ready for streaming",
-        merged_files.len()
-    );
-
-    Ok(merged_files)
+        .collect()
 }
 
-/// Sort a single segment file: deduplicate, filter self-citations, sort by cited_id
+/// Sort a single segment file: deduplicate, filter self-citations, and sort by
+/// (cited_id, citing_doi, ref_index) — the key the k-way merge expects.
 fn sort_single_segment(input: &Path, output: &Path) -> Result<()> {
     // Each segment is small enough to fit in memory (~1M rows typically)
     let mut df = LazyFrame::scan_parquet(input, Default::default())?
@@ -84,7 +62,10 @@ fn sort_single_segment(input: &Path, output: &Path) -> Result<()> {
             UniqueKeepStrategy::First,
         )
         .filter(col("citing_doi").neq(col("cited_id")))
-        .sort(["cited_id"], SortMultipleOptions::default())
+        .sort(
+            ["cited_id", "citing_doi", "ref_index"],
+            SortMultipleOptions::default(),
+        )
         .collect()
         .map_err(|e| anyhow::anyhow!("Failed to process segment: {}", e))?;
 
@@ -93,477 +74,6 @@ fn sort_single_segment(input: &Path, output: &Path) -> Result<()> {
         .with_compression(ParquetCompression::Zstd(None))
         .finish(&mut df)
         .map_err(|e| anyhow::anyhow!("Failed to write sorted segment: {}", e))?;
-
-    Ok(())
-}
-
-/// Merge sorted segments in rounds: pairs → fewer files → repeat until small enough.
-/// Returns a Vec of sorted files (may be multiple if total is very large).
-fn merge_sorted_segments_rounds(
-    mut segments: Vec<PathBuf>,
-    partition_path: &Path,
-) -> Result<Vec<PathBuf>> {
-    let mut round = 0;
-
-    // Keep merging until we have few enough files or they're too large to merge further
-    while segments.len() > 1 {
-        // Check if remaining files are too large to merge (>100M rows total)
-        let total_rows: usize = segments
-            .iter()
-            .filter_map(|p| get_parquet_row_count(p).ok())
-            .sum();
-
-        // If we have few files and they're very large, stop merging
-        // These will be handled by streaming merge in the output phase
-        if segments.len() <= MAX_STREAMING_FILES && total_rows > STREAMING_ROW_THRESHOLD {
-            info!(
-                "  Stopping merge rounds: {} files with {} total rows (will use streaming merge)",
-                segments.len(),
-                total_rows
-            );
-            break;
-        }
-
-        let starting_count = segments.len();
-        info!(
-            "  Merge round {}: {} files -> {} files",
-            round,
-            segments.len(),
-            segments.len().div_ceil(2)
-        );
-
-        let mut next_round = Vec::new();
-
-        for (i, chunk) in segments.chunks(2).enumerate() {
-            if chunk.len() == 2 {
-                let output = partition_path.join(format!("_merge_r{}_{}.parquet", round, i));
-                let merged_files =
-                    merge_two_sorted_parquets(&chunk[0], &chunk[1], &output, partition_path)?;
-                next_round.extend(merged_files);
-
-                if let Err(e) = fs::remove_file(&chunk[0]) {
-                    warn!("Failed to cleanup temp file: {}", e);
-                }
-                if let Err(e) = fs::remove_file(&chunk[1]) {
-                    warn!("Failed to cleanup temp file: {}", e);
-                }
-            } else {
-                // Odd one out, carry to next round
-                next_round.push(chunk[0].clone());
-            }
-        }
-
-        segments = next_round;
-
-        // CRITICAL: If we started with 2 files and ended with more, chunked merge was used.
-        // The chunked output files ARE globally sorted (all rows in file N come before file N+1).
-        // No further merging is needed - these are the final sorted files for streaming.
-        if starting_count == 2 && segments.len() > 1 {
-            info!(
-                "  Chunked merge of final 2 files produced {} globally sorted files - merge complete",
-                segments.len()
-            );
-            break;
-        }
-
-        round += 1;
-    }
-
-    Ok(segments)
-}
-
-/// Threshold for using chunked merge (rows). Files larger than this use streaming merge.
-const CHUNKED_MERGE_THRESHOLD: usize = 5_000_000;
-
-/// Merge two sorted parquet files.
-/// Returns a Vec of output file paths (may be multiple for large merges).
-fn merge_two_sorted_parquets(
-    a: &Path,
-    b: &Path,
-    output: &Path,
-    partition_path: &Path,
-) -> Result<Vec<PathBuf>> {
-    // Get row counts to decide merge strategy
-    let rows_a = get_parquet_row_count(a)?;
-    let rows_b = get_parquet_row_count(b)?;
-    let total_rows = rows_a + rows_b;
-
-    if total_rows <= CHUNKED_MERGE_THRESHOLD {
-        // Small enough for in-memory merge
-        merge_two_sorted_parquets_inmemory(a, b, output)?;
-        Ok(vec![output.to_path_buf()])
-    } else {
-        // Use chunked streaming merge for large files
-        info!(
-            "  Using chunked merge for {} + {} = {} rows",
-            rows_a, rows_b, total_rows
-        );
-        merge_two_sorted_parquets_chunked(a, b, output, partition_path)
-    }
-}
-
-/// Get row count from parquet file metadata (reads only footer, not data)
-fn get_parquet_row_count(path: &Path) -> Result<usize> {
-    use parquet::file::reader::{FileReader, SerializedFileReader};
-
-    let file = File::open(path)?;
-    let reader = SerializedFileReader::new(file)
-        .map_err(|e| anyhow::anyhow!("Failed to read parquet metadata: {}", e))?;
-    let num_rows = reader.metadata().file_metadata().num_rows();
-    Ok(num_rows as usize)
-}
-
-/// Merge two small sorted parquet files in memory
-fn merge_two_sorted_parquets_inmemory(a: &Path, b: &Path, output: &Path) -> Result<()> {
-    let df_a = LazyFrame::scan_parquet(a, Default::default())?;
-    let df_b = LazyFrame::scan_parquet(b, Default::default())?;
-
-    // Concat and sort (efficient for already-sorted data)
-    let mut merged = concat([df_a, df_b], UnionArgs::default())?
-        .sort(["cited_id"], SortMultipleOptions::default())
-        .collect()
-        .map_err(|e| anyhow::anyhow!("Failed to merge: {}", e))?;
-
-    let file = File::create(output)?;
-    ParquetWriter::new(file)
-        .with_compression(ParquetCompression::Zstd(None))
-        .finish(&mut merged)
-        .map_err(|e| anyhow::anyhow!("Failed to write merged file: {}", e))?;
-
-    Ok(())
-}
-
-/// Merge two large sorted parquet files using chunked streaming.
-/// Returns the chunk files directly (without concatenating) to avoid OOM.
-fn merge_two_sorted_parquets_chunked(
-    a: &Path,
-    b: &Path,
-    output: &Path, // Used to derive unique chunk prefix
-    partition_path: &Path,
-) -> Result<Vec<PathBuf>> {
-    let chunk_size = STREAM_CHUNK_SIZE as i64;
-
-    // Derive unique prefix from output path (e.g., "_merge_r20_0" from "_merge_r20_0.parquet")
-    let chunk_prefix = output
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("_chunk");
-
-    // Read row counts
-    let rows_a = get_parquet_row_count(a)? as i64;
-    let rows_b = get_parquet_row_count(b)? as i64;
-
-    let mut offset_a = 0i64;
-    let mut offset_b = 0i64;
-    let mut pending_a: Option<DataFrame> = None;
-    let mut pending_b: Option<DataFrame> = None;
-    let mut output_chunks: Vec<PathBuf> = Vec::new();
-    let mut chunk_num = 0usize;
-
-    loop {
-        if pending_a.is_none() && offset_a < rows_a {
-            let chunk = LazyFrame::scan_parquet(a, Default::default())?
-                .slice(offset_a, chunk_size as u32)
-                .collect()?;
-            offset_a += chunk.height() as i64;
-            if chunk.height() > 0 {
-                pending_a = Some(chunk);
-            }
-        }
-
-        if pending_b.is_none() && offset_b < rows_b {
-            let chunk = LazyFrame::scan_parquet(b, Default::default())?
-                .slice(offset_b, chunk_size as u32)
-                .collect()?;
-            offset_b += chunk.height() as i64;
-            if chunk.height() > 0 {
-                pending_b = Some(chunk);
-            }
-        }
-
-        match (&pending_a, &pending_b) {
-            (None, None) => break,
-            (Some(df), None) => {
-                write_chunk_to_file(
-                    df,
-                    partition_path,
-                    chunk_prefix,
-                    &mut output_chunks,
-                    &mut chunk_num,
-                )?;
-                pending_a = None;
-            }
-            (None, Some(df)) => {
-                write_chunk_to_file(
-                    df,
-                    partition_path,
-                    chunk_prefix,
-                    &mut output_chunks,
-                    &mut chunk_num,
-                )?;
-                pending_b = None;
-            }
-            (Some(df_a), Some(df_b)) => {
-                let (to_write, remaining_a, remaining_b) = merge_chunks(df_a, df_b)?;
-
-                if to_write.height() > 0 {
-                    write_chunk_to_file(
-                        &to_write,
-                        partition_path,
-                        chunk_prefix,
-                        &mut output_chunks,
-                        &mut chunk_num,
-                    )?;
-                }
-
-                pending_a = if remaining_a.height() > 0 {
-                    Some(remaining_a)
-                } else {
-                    None
-                };
-                pending_b = if remaining_b.height() > 0 {
-                    Some(remaining_b)
-                } else {
-                    None
-                };
-            }
-        }
-    }
-
-    // Return the chunk files directly - they're already sorted in order
-    // The streaming phase will iterate through them sequentially
-    // This avoids OOM from trying to concatenate 100M+ rows
-    Ok(output_chunks)
-}
-
-/// Write a DataFrame chunk to a numbered file with unique prefix
-fn write_chunk_to_file(
-    df: &DataFrame,
-    partition_path: &Path,
-    prefix: &str,
-    output_chunks: &mut Vec<PathBuf>,
-    chunk_num: &mut usize,
-) -> Result<()> {
-    // Use prefix to ensure unique filenames across concurrent merges
-    let chunk_path = partition_path.join(format!("{}_c{:05}.parquet", prefix, chunk_num));
-    let file = File::create(&chunk_path)?;
-    ParquetWriter::new(file)
-        .with_compression(ParquetCompression::Zstd(None))
-        .finish(&mut df.clone())?;
-    output_chunks.push(chunk_path);
-    *chunk_num += 1;
-    Ok(())
-}
-
-/// Merge two sorted chunks, returning (safe_to_write, remaining_a, remaining_b)
-/// "Safe to write" means rows that are guaranteed to be in final sorted order
-fn merge_chunks(df_a: &DataFrame, df_b: &DataFrame) -> Result<(DataFrame, DataFrame, DataFrame)> {
-    // Handle empty DataFrames to avoid underflow on height() - 1
-    let empty = DataFrame::new(vec![
-        Column::new("citing_doi".into(), Vec::<&str>::new()),
-        Column::new("ref_index".into(), Vec::<u32>::new()),
-        Column::new("cited_id".into(), Vec::<&str>::new()),
-        Column::new("provenance".into(), Vec::<&str>::new()),
-        Column::new("ref_json".into(), Vec::<&str>::new()),
-    ])?;
-
-    if df_a.height() == 0 {
-        return Ok((empty.clone(), empty, df_b.clone()));
-    }
-    if df_b.height() == 0 {
-        return Ok((empty.clone(), df_a.clone(), empty));
-    }
-
-    // Get the last cited_id from each chunk
-    let cited_a = df_a.column("cited_id")?.str()?;
-    let cited_b = df_b.column("cited_id")?.str()?;
-
-    let last_a = cited_a.get(df_a.height() - 1).unwrap_or("");
-    let last_b = cited_b.get(df_b.height() - 1).unwrap_or("");
-
-    // The "safe boundary" is the smaller of the two last values
-    // Rows with cited_id <= safe_boundary are safe to write
-    let safe_boundary = if last_a <= last_b { last_a } else { last_b };
-
-    // Concat and sort both chunks
-    let merged = concat(
-        [df_a.clone().lazy(), df_b.clone().lazy()],
-        UnionArgs::default(),
-    )?
-    .sort(["cited_id"], SortMultipleOptions::default())
-    .collect()?;
-
-    // Split into safe-to-write and remaining
-    let cited_merged = merged.column("cited_id")?.str()?;
-
-    // Find the split point
-    let mut split_idx = merged.height();
-    for i in 0..merged.height() {
-        let id = cited_merged.get(i).unwrap_or("");
-        if id > safe_boundary {
-            split_idx = i;
-            break;
-        }
-    }
-
-    let to_write = merged.slice(0, split_idx);
-    let remaining = merged.slice(split_idx as i64, merged.height() - split_idx);
-
-    // Put remaining in "A" slot, empty in "B" slot - will be handled on next iteration
-    Ok((to_write, remaining, empty))
-}
-
-/// Stream through multiple sorted parquet files in sequence.
-/// The files must be globally sorted (each file is sorted internally, and files are
-/// in order such that all rows in file N come before all rows in file N+1).
-fn stream_sorted_files_and_write(
-    sorted_files: &[PathBuf],
-    arxiv_index: Option<&FstIndex>,
-    valid_writer: &mut Option<BufWriter<File>>,
-    failed_writer: &mut Option<BufWriter<File>>,
-    publisher_writer: &mut Option<BufWriter<File>>,
-    crossref_writer: &mut Option<BufWriter<File>>,
-    mined_writer: &mut Option<BufWriter<File>>,
-    stats: &mut AggregationStats,
-) -> Result<()> {
-    if sorted_files.is_empty() {
-        return Ok(());
-    }
-
-    info!(
-        "  Streaming through {} sorted file(s)...",
-        sorted_files.len()
-    );
-
-    let mut current_cited_id: Option<String> = None;
-    let mut current_group: Vec<GroupedCitation> = Vec::new();
-    let mut total_rows_processed = 0u64;
-
-    for (file_idx, sorted_path) in sorted_files.iter().enumerate() {
-        info!(
-            "  Processing file {}/{}: {}",
-            file_idx + 1,
-            sorted_files.len(),
-            sorted_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        );
-
-        stream_sorted_file_continuing(
-            sorted_path,
-            arxiv_index,
-            valid_writer,
-            failed_writer,
-            publisher_writer,
-            crossref_writer,
-            mined_writer,
-            stats,
-            &mut current_cited_id,
-            &mut current_group,
-            &mut total_rows_processed,
-        )?;
-    }
-
-    // Flush the final group after all files processed
-    if let Some(ref id) = current_cited_id {
-        flush_group(
-            id,
-            &current_group,
-            arxiv_index,
-            valid_writer,
-            failed_writer,
-            publisher_writer,
-            crossref_writer,
-            mined_writer,
-            stats,
-        )?;
-    }
-
-    info!("  Total rows processed: {}", total_rows_processed);
-
-    Ok(())
-}
-
-/// Stream through a single sorted file, continuing group aggregation from previous file.
-#[allow(clippy::too_many_arguments)]
-fn stream_sorted_file_continuing(
-    sorted_path: &Path,
-    arxiv_index: Option<&FstIndex>,
-    valid_writer: &mut Option<BufWriter<File>>,
-    failed_writer: &mut Option<BufWriter<File>>,
-    publisher_writer: &mut Option<BufWriter<File>>,
-    crossref_writer: &mut Option<BufWriter<File>>,
-    mined_writer: &mut Option<BufWriter<File>>,
-    stats: &mut AggregationStats,
-    current_cited_id: &mut Option<String>,
-    current_group: &mut Vec<GroupedCitation>,
-    total_rows_processed: &mut u64,
-) -> Result<()> {
-    let total_rows = get_parquet_row_count(sorted_path)?;
-
-    if total_rows == 0 {
-        return Ok(());
-    }
-
-    let mut offset = 0i64;
-    let chunk_size = STREAM_CHUNK_SIZE as i64;
-
-    while (offset as usize) < total_rows {
-        let chunk = LazyFrame::scan_parquet(sorted_path, Default::default())?
-            .slice(offset, chunk_size as u32)
-            .collect()
-            .map_err(|e| anyhow::anyhow!("Failed to read chunk at offset {}: {}", offset, e))?;
-
-        if chunk.height() == 0 {
-            break;
-        }
-
-        let cited_col = chunk.column("cited_id")?.str()?;
-        let citing_col = chunk.column("citing_doi")?.str()?;
-        let prov_col = chunk.column("provenance")?.str()?;
-        let json_col = chunk.column("ref_json")?.str()?;
-
-        for i in 0..chunk.height() {
-            let cited_id = cited_col.get(i).unwrap_or("");
-
-            if current_cited_id.as_deref() != Some(cited_id) {
-                if let Some(ref id) = current_cited_id {
-                    flush_group(
-                        id,
-                        current_group,
-                        arxiv_index,
-                        valid_writer,
-                        failed_writer,
-                        publisher_writer,
-                        crossref_writer,
-                        mined_writer,
-                        stats,
-                    )?;
-                }
-                *current_cited_id = Some(cited_id.to_string());
-                current_group.clear();
-            }
-
-            current_group.push(GroupedCitation {
-                citing_doi: citing_col.get(i).unwrap_or("").to_string(),
-                provenance: prov_col.get(i).unwrap_or("mined").to_string(),
-                ref_json: json_col.get(i).unwrap_or("null").to_string(),
-            });
-        }
-
-        let prev_milestone = *total_rows_processed / PROGRESS_LOG_INTERVAL;
-        offset += chunk.height() as i64;
-        *total_rows_processed += chunk.height() as u64;
-        let curr_milestone = *total_rows_processed / PROGRESS_LOG_INTERVAL;
-
-        if curr_milestone > prev_milestone {
-            info!(
-                "  Progress: {} rows, {} valid DOIs",
-                total_rows_processed, stats.valid_count
-            );
-        }
-    }
 
     Ok(())
 }
@@ -656,8 +166,8 @@ fn flush_group(
     Ok(())
 }
 
-/// Process a large partition using external sort.
-/// Sorts all segments to temp files, then streams through sorted data.
+/// Process a large partition using external sort:
+/// sort each segment, then k-way merge directly into group aggregation.
 fn process_partition_external_sort(
     segments: &[PathBuf],
     partition_path: &Path,
@@ -675,18 +185,63 @@ fn process_partition_external_sort(
         partition_path.display()
     );
 
-    let sorted_files = sort_partition_to_temp(segments, partition_path)?;
+    let sorted_files = sort_segments_to_temp(segments, partition_path)?;
 
-    let result = stream_sorted_files_and_write(
-        &sorted_files,
-        arxiv_index,
-        valid_writer,
-        failed_writer,
-        publisher_writer,
-        crossref_writer,
-        mined_writer,
-        stats,
-    );
+    let chunk_rows = (MERGE_BUFFER_ROWS / sorted_files.len().max(1)).clamp(1024, STREAM_CHUNK_SIZE);
+
+    let mut current_cited_id: Option<String> = None;
+    let mut current_group: Vec<GroupedCitation> = Vec::new();
+    let mut rows_processed = 0u64;
+
+    let merge_result = (|| -> Result<()> {
+        merge_sorted_segments(&sorted_files, chunk_rows, |row: MergeRow| {
+            if current_cited_id.as_deref() != Some(row.cited_id.as_str()) {
+                if let Some(id) = current_cited_id.take() {
+                    flush_group(
+                        &id,
+                        &current_group,
+                        arxiv_index,
+                        valid_writer,
+                        failed_writer,
+                        publisher_writer,
+                        crossref_writer,
+                        mined_writer,
+                        stats,
+                    )?;
+                }
+                current_cited_id = Some(row.cited_id);
+                current_group.clear();
+            }
+            current_group.push(GroupedCitation {
+                citing_doi: row.citing_doi,
+                provenance: row.provenance,
+                ref_json: row.ref_json,
+            });
+            rows_processed += 1;
+            if rows_processed.is_multiple_of(PROGRESS_LOG_INTERVAL) {
+                info!(
+                    "  Progress: {} rows, {} valid DOIs",
+                    rows_processed, stats.valid_count
+                );
+            }
+            Ok(())
+        })?;
+
+        if let Some(id) = current_cited_id.take() {
+            flush_group(
+                &id,
+                &current_group,
+                arxiv_index,
+                valid_writer,
+                failed_writer,
+                publisher_writer,
+                crossref_writer,
+                mined_writer,
+                stats,
+            )?;
+        }
+        Ok(())
+    })();
 
     for sorted_path in &sorted_files {
         if sorted_path.exists() {
@@ -700,7 +255,8 @@ fn process_partition_external_sort(
         }
     }
 
-    result?;
+    merge_result?;
+    info!("  Total rows processed: {}", rows_processed);
 
     stats.partitions_processed += 1;
     Ok(())
@@ -1361,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_partition_to_temp() {
+    fn test_sort_segments_to_temp() {
         use polars::prelude::*;
 
         let dir = tempdir().unwrap();
@@ -1391,23 +947,18 @@ mod tests {
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("parquet"))
             .collect();
 
-        // Sort to temp file(s)
-        let sorted_files = sort_partition_to_temp(&segments, &partition_dir).unwrap();
+        // Sort each segment to its own temp file
+        let sorted_files = sort_segments_to_temp(&segments, &partition_dir).unwrap();
+        assert_eq!(sorted_files.len(), segments.len());
 
-        // For small data, should produce single file
-        assert!(!sorted_files.is_empty());
-
-        // Verify all sorted files exist and data is sorted
         let mut all_cited_ids = Vec::new();
         for sorted_path in &sorted_files {
             assert!(sorted_path.exists());
-
             let sorted_df = LazyFrame::scan_parquet(sorted_path, Default::default())
                 .unwrap()
                 .collect()
                 .unwrap();
-
-            let cited_ids: Vec<_> = sorted_df
+            let ids: Vec<String> = sorted_df
                 .column("cited_id")
                 .unwrap()
                 .str()
@@ -1415,11 +966,12 @@ mod tests {
                 .into_iter()
                 .map(|s| s.unwrap().to_string())
                 .collect();
-            all_cited_ids.extend(cited_ids);
+            let mut sorted_ids = ids.clone();
+            sorted_ids.sort();
+            assert_eq!(ids, sorted_ids, "each file must be internally sorted");
+            all_cited_ids.extend(ids);
         }
-
-        // Combined data should be sorted: aaa, mmm, zzz
-        assert_eq!(all_cited_ids.len(), 3);
+        all_cited_ids.sort();
         assert_eq!(
             all_cited_ids,
             vec!["10.1234/aaa", "10.1234/mmm", "10.1234/zzz"]
@@ -1582,5 +1134,90 @@ mod tests {
         let content = fs::read_to_string(&valid_output).unwrap();
         let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(record["citation_count"], 101);
+    }
+
+    /// Regression for findings C1/C2: overlapping segments through the
+    /// external-sort path must produce exactly one record per cited_id.
+    #[test]
+    fn test_external_sort_one_record_per_cited_id() {
+        use polars::prelude::*;
+
+        let dir = tempdir().unwrap();
+        let partition_path = dir.path().join("partitions/10.48550");
+        fs::create_dir_all(&partition_path).unwrap();
+        let valid_output = dir.path().join("valid.jsonl");
+
+        // 3 segments; every segment cites BOTH targets so key ranges fully overlap.
+        for seg_num in 0..3 {
+            let mut df = DataFrame::new(vec![
+                Column::new(
+                    "citing_doi".into(),
+                    &[
+                        format!("10.1111/citing{}a", seg_num),
+                        format!("10.1111/citing{}b", seg_num),
+                    ],
+                ),
+                Column::new("ref_index".into(), &[0u32, 0u32]),
+                Column::new(
+                    "cited_id".into(),
+                    &["10.48550/arxiv.2403.00001", "10.48550/arxiv.2403.00002"],
+                ),
+                Column::new("provenance".into(), &["mined", "mined"]),
+                Column::new("ref_json".into(), &[r#"{"t":1}"#, r#"{"t":2}"#]),
+            ])
+            .unwrap();
+            let path = partition_path.join(format!("segment_{:04}.parquet", seg_num));
+            ParquetWriter::new(File::create(&path).unwrap())
+                .finish(&mut df)
+                .unwrap();
+        }
+
+        let segments: Vec<_> = fs::read_dir(&partition_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+
+        let fst_path = dir.path().join("test.fst");
+        {
+            use crate::index::FstIndexBuilder;
+            let mut builder = FstIndexBuilder::new(&fst_path).unwrap();
+            builder.insert("10.48550/arxiv.2403.00001").unwrap();
+            builder.insert("10.48550/arxiv.2403.00002").unwrap();
+            builder.finish().unwrap();
+        }
+        let index = FstIndex::load(&fst_path).unwrap();
+
+        let mut valid_writer = Some(BufWriter::new(File::create(&valid_output).unwrap()));
+        let mut stats = AggregationStats::default();
+
+        process_partition_external_sort(
+            &segments,
+            &partition_path,
+            Some(&index),
+            &mut valid_writer,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut stats,
+        )
+        .unwrap();
+        valid_writer.as_mut().unwrap().flush().unwrap();
+
+        let content = fs::read_to_string(&valid_output).unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(records.len(), 2, "exactly one record per cited work");
+        for rec in &records {
+            assert_eq!(
+                rec["citation_count"], 3,
+                "all 3 segments' citations grouped"
+            );
+        }
+        assert_eq!(stats.total_citations, 6);
     }
 }

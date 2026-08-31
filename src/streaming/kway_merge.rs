@@ -1,10 +1,5 @@
 //! K-way streaming merge over individually-sorted parquet segments.
 
-// TODO(task-2): remove this allow once the aggregator calls into this module.
-// `src/main.rs` re-declares `mod streaming;` privately, so the bin target sees
-// every item here as unreachable until the aggregator is rewired onto it.
-#![allow(dead_code)]
-
 use anyhow::Result;
 use polars::prelude::*;
 use std::cmp::Reverse;
@@ -127,6 +122,12 @@ pub fn merge_sorted_segments<F>(segments: &[PathBuf], chunk_rows: usize, mut emi
 where
     F: FnMut(MergeRow) -> Result<()>,
 {
+    // A zero-row chunk reads nothing, which the EOF check would misread as
+    // exhaustion — silently emitting no rows at all.
+    if chunk_rows == 0 {
+        anyhow::bail!("chunk_rows must be > 0");
+    }
+
     let mut cursors: Vec<SegmentCursor> = segments
         .iter()
         .map(|p| SegmentCursor::new(p, chunk_rows))
@@ -271,6 +272,18 @@ mod tests {
 
         let merged = collect_merge(&[a, b], 8);
         assert_eq!(merged.len(), 1);
+    }
+
+    /// `chunk_rows == 0` would read empty chunks forever-looking-like-EOF and
+    /// silently emit nothing; it must be rejected instead.
+    #[test]
+    fn test_zero_chunk_rows_is_rejected() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.parquet");
+        write_segment(&a, &[("id1", "c", 0)]);
+
+        let err = merge_sorted_segments(&[a], 0, |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("chunk_rows must be > 0"));
     }
 
     #[test]
