@@ -51,7 +51,6 @@ impl ExtractionCheckpoint {
     }
 
     /// Check if a filename has already been processed.
-    #[allow(dead_code)] // extraction filters against `completed_snapshot` instead
     #[inline]
     pub fn is_completed(&self, filename: &str) -> bool {
         self.completed.contains(filename)

@@ -9,7 +9,6 @@ use super::partition_key;
 
 /// A row for partitioned storage
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PartitionRow {
     pub citing_doi: String,
     pub ref_index: u32,
@@ -19,7 +18,6 @@ pub struct PartitionRow {
 }
 
 /// Buffer for accumulating rows before writing a segment
-#[allow(dead_code)]
 struct SegmentBuffer {
     citing_dois: Vec<String>,
     ref_indices: Vec<u32>,
@@ -28,7 +26,6 @@ struct SegmentBuffer {
     ref_jsons: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl SegmentBuffer {
     fn new() -> Self {
         Self {
@@ -56,16 +53,8 @@ impl SegmentBuffer {
         self.citing_dois.is_empty()
     }
 
-    fn clear(&mut self) {
-        self.citing_dois.clear();
-        self.ref_indices.clear();
-        self.cited_ids.clear();
-        self.provenances.clear();
-        self.ref_jsons.clear();
-    }
-
     /// Write the buffered rows to a parquet segment, consuming the buffers
-    /// (they are left empty, so no separate `clear()` is needed).
+    /// (they are left empty, ready to accumulate the next segment).
     fn write_parquet(&mut self, path: &Path) -> Result<()> {
         let mut df = DataFrame::new(vec![
             Column::new("citing_doi".into(), std::mem::take(&mut self.citing_dois)),
@@ -89,7 +78,6 @@ impl SegmentBuffer {
 }
 
 /// Writes partition rows to append-only segment files
-#[allow(dead_code)]
 pub struct SegmentedPartitionWriter {
     partition_dir: PathBuf,
     buffers: HashMap<String, SegmentBuffer>,
@@ -98,7 +86,6 @@ pub struct SegmentedPartitionWriter {
     total_rows_written: usize,
 }
 
-#[allow(dead_code)]
 impl SegmentedPartitionWriter {
     /// Create a new segmented partition writer
     pub fn new(partition_dir: &Path, flush_threshold: usize) -> Result<Self> {

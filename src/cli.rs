@@ -143,7 +143,6 @@ impl PipelineArgs {
     }
 
     /// Check if a provenance should be included based on the filter
-    #[allow(dead_code)] // extraction workers call the free function below
     pub fn should_include_provenance(&self, provenance: &str) -> bool {
         should_include_provenance_filter(&self.provenance, provenance)
     }

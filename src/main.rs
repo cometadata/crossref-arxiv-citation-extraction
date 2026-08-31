@@ -1,17 +1,8 @@
-mod cli;
-mod commands;
-mod common;
-mod extract;
-mod index;
-mod input;
-mod streaming;
-mod validation;
-
 use anyhow::Result;
 use clap::Parser;
 
-use cli::{Cli, Commands};
-use commands::{run_build_index, run_pipeline, BuildIndexArgs};
+use crossref_citation_extraction::cli::{Cli, Commands};
+use crossref_citation_extraction::commands::{run_build_index, run_pipeline, BuildIndexArgs};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -25,12 +16,11 @@ fn main() -> Result<()> {
             output,
             log_level,
         } => {
-            let args = BuildIndexArgs {
+            run_build_index(BuildIndexArgs {
                 input,
                 output,
                 log_level,
-            };
-            run_build_index(args)?;
+            })?;
         }
     }
 

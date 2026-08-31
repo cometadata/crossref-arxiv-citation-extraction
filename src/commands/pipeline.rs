@@ -582,7 +582,7 @@ fn run_scalable_extraction(args: &PipelineArgs, partition_dir: &Path) -> Result<
 fn extract_arxiv_as_dois(text: &str) -> Vec<(String, String)> {
     extract_arxiv_matches_from_text(text)
         .into_iter()
-        .map(|m| (format!("10.48550/arXiv.{}", m.id), m.raw))
+        .map(|m| (m.arxiv_doi, m.raw))
         .collect()
 }
 

@@ -10,12 +10,10 @@ use std::time::Instant;
 
 /// Memory-efficient DOI index using FST (Finite State Transducer)
 /// Provides ~50x memory reduction compared to HashSet<String>
-#[allow(dead_code)]
 pub struct FstIndex {
     set: Set<Mmap>,
 }
 
-#[allow(dead_code)]
 impl FstIndex {
     /// Load an FST index from disk
     pub fn load(path: &Path) -> Result<Self> {
@@ -42,12 +40,10 @@ impl FstIndex {
 }
 
 /// Builder for creating FST indexes from sorted DOI iterators
-#[allow(dead_code)]
 pub struct FstIndexBuilder {
     builder: SetBuilder<BufWriter<File>>,
 }
 
-#[allow(dead_code)]
 impl FstIndexBuilder {
     /// Create a new builder that writes to the given path
     pub fn new(path: &Path) -> Result<Self> {
@@ -70,61 +66,12 @@ impl FstIndexBuilder {
     }
 }
 
-/// Build an FST index from an iterator of DOIs (handles sorting and deduplication)
-#[allow(dead_code)]
-pub fn build_fst_from_iter<I>(dois: I, output_path: &Path, temp_dir: &Path) -> Result<()>
-where
-    I: Iterator<Item = String>,
-{
-    let unsorted_path = temp_dir.join("dois_unsorted.txt");
-    let sorted_path = temp_dir.join("dois_sorted.txt");
-
-    {
-        let mut writer = BufWriter::new(File::create(&unsorted_path)?);
-        for doi in dois {
-            writeln!(writer, "{}", doi.to_lowercase())?;
-        }
-        writer.flush()?;
-    }
-
-    // Use LC_ALL=C to ensure byte-order sorting (required for FST)
-    let status = Command::new("sort")
-        .env("LC_ALL", "C")
-        .arg("-u") // unique
-        .arg("-o")
-        .arg(&sorted_path)
-        .arg(&unsorted_path)
-        .status()?;
-
-    if !status.success() {
-        anyhow::bail!("sort command failed with status: {}", status);
-    }
-
-    let mut builder = FstIndexBuilder::new(output_path)?;
-    let reader = BufReader::new(File::open(&sorted_path)?);
-
-    for line in reader.lines() {
-        let doi = line?;
-        if !doi.is_empty() {
-            builder.insert(&doi)?;
-        }
-    }
-
-    builder.finish()?;
-
-    let _ = std::fs::remove_file(&unsorted_path);
-    let _ = std::fs::remove_file(&sorted_path);
-
-    Ok(())
-}
-
 #[derive(serde::Deserialize)]
 struct IdRecord {
     id: Option<String>,
 }
 
 /// Build an FST index from a source of raw JSONL records (uses the "id" field).
-#[allow(dead_code)]
 pub fn build_fst_index_from_source<I>(source: I, output_path: &Path, temp_dir: &Path) -> Result<()>
 where
     I: Iterator<Item = Result<String>>,
@@ -279,26 +226,5 @@ mod tests {
         assert!(index.is_empty());
         assert_eq!(index.len(), 0);
         assert!(!index.contains("anything"));
-    }
-
-    #[test]
-    fn test_build_fst_from_unsorted_dois() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("sorted.fst");
-
-        // Unsorted DOIs
-        let dois = vec![
-            "10.5678/zzz".to_string(),
-            "10.1234/aaa".to_string(),
-            "10.1234/bbb".to_string(),
-            "10.5678/zzz".to_string(), // Duplicate
-        ];
-
-        build_fst_from_iter(dois.into_iter(), &path, dir.path()).unwrap();
-
-        let index = FstIndex::load(&path).unwrap();
-        assert_eq!(index.len(), 3); // Deduplicated
-        assert!(index.contains("10.1234/aaa"));
-        assert!(index.contains("10.5678/zzz"));
     }
 }
