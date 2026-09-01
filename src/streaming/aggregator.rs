@@ -297,7 +297,7 @@ pub struct AggregationStats {
 }
 
 /// Clean up any stale temp files from interrupted runs.
-/// This includes _sorted*.parquet, _merge_*.parquet, _chunk_*.parquet, and _stage_*.parquet files.
+/// This includes the _sorted*.parquet files written by the external-sort path.
 fn cleanup_stale_temp_files(partition_dir: &Path) -> Result<()> {
     for entry in fs::read_dir(partition_dir)? {
         let entry = entry?;
@@ -307,11 +307,7 @@ fn cleanup_stale_temp_files(partition_dir: &Path) -> Result<()> {
                 for file_entry in partition_entries.filter_map(|e| e.ok()) {
                     let file_path = file_entry.path();
                     if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with("_sorted")
-                            || name.starts_with("_merge")
-                            || name.starts_with("_chunk")
-                            || name.starts_with("_stage")
-                        {
+                        if name.starts_with("_sorted") {
                             info!("Cleaning up stale temp file: {}", file_path.display());
                             if let Err(e) = fs::remove_file(&file_path) {
                                 warn!(
