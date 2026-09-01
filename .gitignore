@@ -13,6 +13,9 @@ Cargo.lock
 CLAUDE.md
 .claude/
 
+# Local planning docs
+docs/
+
 # Dev container
 .devcontainer/
 
